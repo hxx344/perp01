@@ -7,7 +7,7 @@ import time
 import asyncio
 import traceback
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
 from exchanges import ExchangeFactory
@@ -368,31 +368,47 @@ class TradingBot:
                 # Get active orders
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
 
+                def prepare_close_orders(orders):
+                    close_orders = []
+                    total = Decimal('0')
+                    for o in orders:
+                        if o.side == self.config.close_order_side:
+                            size = Decimal(o.size)
+                            close_orders.append({
+                                'id': o.order_id,
+                                'price': o.price,
+                                'size': size
+                            })
+                            total += size
+                    return close_orders, total
+
                 # Filter close orders
-                self.active_close_orders = []
-                for order in active_orders:
-                    if order.side == self.config.close_order_side:
-                        self.active_close_orders.append({
-                            'id': order.order_id,
-                            'price': order.price,
-                            'size': order.size
-                        })
+                self.active_close_orders, active_close_amount = prepare_close_orders(active_orders)
 
                 # Get positions
                 position_amt = await self.exchange_client.get_account_positions()
+                position_abs = abs(position_amt)
+                mismatch_amount = abs(position_abs - active_close_amount)
 
-                # Calculate active closing amount
-                active_close_amount = sum(
-                    Decimal(order.get('size', 0))
-                    for order in self.active_close_orders
-                    if isinstance(order, dict)
-                )
+                # Attempt automatic balancing when mismatch is moderate
+                auto_balanced = False
+                lower_threshold = 2 * self.config.quantity
+                upper_threshold = 4 * self.config.quantity
+                if lower_threshold < mismatch_amount <= upper_threshold:
+                    auto_balanced = await self._attempt_auto_balance(position_amt, active_close_amount)
+                    if auto_balanced:
+                        # Refresh orders and positions after balancing attempt
+                        active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                        self.active_close_orders, active_close_amount = prepare_close_orders(active_orders)
+                        position_amt = await self.exchange_client.get_account_positions()
+                        position_abs = abs(position_amt)
+                        mismatch_amount = abs(position_abs - active_close_amount)
 
                 self.logger.log(f"Current Position: {position_amt} | Active closing amount: {active_close_amount} | "
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
                 # Check for position mismatch
-                if abs(position_amt - active_close_amount) > (2 * self.config.quantity):
+                if mismatch_amount > (2 * self.config.quantity):
                     error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
                     error_message += "Position mismatch detected\n"
                     error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
@@ -418,6 +434,84 @@ class TradingBot:
                 self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
 
             print("--------------------------------")
+
+    async def _attempt_auto_balance(self, position_amt: Decimal, active_close_amount: Decimal) -> bool:
+        """Try to automatically balance position and close orders when mismatch is moderate."""
+        try:
+            position_abs = abs(position_amt)
+            difference = position_abs - active_close_amount
+
+            if difference == 0:
+                return False
+
+            if difference > 0:
+                # Need additional close orders
+                if len(self.active_close_orders) >= self.config.max_orders:
+                    self.logger.log("[AUTO-BALANCE] Max close orders reached; cannot add more.", "WARNING")
+                    return False
+
+                close_side = self.config.close_order_side
+                best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
+                tp_multiplier = self.config.take_profit / Decimal('100')
+                if close_side == 'sell':
+                    target_price = best_bid * (Decimal('1') + tp_multiplier)
+                else:
+                    target_price = best_ask * (Decimal('1') - tp_multiplier)
+
+                if self.config.tick_size > 0:
+                    target_price = target_price.quantize(self.config.tick_size, rounding=ROUND_HALF_UP)
+
+                balance_result = await self.exchange_client.place_close_order(
+                    self.config.contract_id,
+                    difference,
+                    target_price,
+                    close_side
+                )
+
+                if balance_result.success:
+                    self.logger.log(
+                        f"[AUTO-BALANCE] Added close order: {difference} @ {target_price}",
+                        "INFO"
+                    )
+                    return True
+
+                self.logger.log(
+                    f"[AUTO-BALANCE] Failed to add close order: {balance_result.error_message}",
+                    "WARNING"
+                )
+                return False
+
+            # difference < 0, cancel excess close orders
+            excess = abs(difference)
+            if not self.active_close_orders:
+                return False
+
+            canceled_amount = Decimal('0')
+            reverse_sort = True if self.config.close_order_side == 'sell' else False
+            for order in sorted(self.active_close_orders, key=lambda o: o['price'], reverse=reverse_sort):
+                if canceled_amount >= excess:
+                    break
+
+                cancel_result = await self.exchange_client.cancel_order(order['id'])
+                if cancel_result.success:
+                    size = Decimal(order['size'])
+                    canceled_amount += size
+                    self.logger.log(
+                        f"[AUTO-BALANCE] Cancelled close order {order['id']} size {size}",
+                        "INFO"
+                    )
+                else:
+                    self.logger.log(
+                        f"[AUTO-BALANCE] Failed to cancel order {order['id']}: {cancel_result.error_message}",
+                        "WARNING"
+                    )
+
+            return canceled_amount > 0
+
+        except Exception as e:
+            self.logger.log(f"[AUTO-BALANCE] Error while balancing positions: {e}", "ERROR")
+            self.logger.log(f"[AUTO-BALANCE] Traceback: {traceback.format_exc()}", "ERROR")
+            return False
 
     async def _meet_grid_step_condition(self) -> bool:
         if self.active_close_orders:
