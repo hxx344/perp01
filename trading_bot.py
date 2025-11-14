@@ -148,7 +148,7 @@ class TradingBot:
             """Handle order updates from WebSocket."""
             try:
                 # Check if this is for our contract
-                if message.get('contract_id') != self.config.contract_id:
+                if str(message.get('contract_id')) != str(self.config.contract_id):
                     return
 
                 order_id = message.get('order_id')

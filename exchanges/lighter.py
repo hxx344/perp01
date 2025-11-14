@@ -213,8 +213,14 @@ class LighterClient(BaseExchangeClient):
 
     def _handle_websocket_order_update(self, order_data_list: List[Dict[str, Any]]):
         """Handle order updates from WebSocket."""
+        contract_id_str = str(self.config.contract_id)
+
         for order_data in order_data_list:
-            if order_data['market_index'] != self.config.contract_id:
+            market_index = order_data.get('market_index')
+            if market_index is None:
+                continue
+
+            if str(market_index) != contract_id_str:
                 continue
 
             side = 'sell' if order_data['is_ask'] else 'buy'
@@ -272,7 +278,7 @@ class LighterClient(BaseExchangeClient):
             if self._order_update_handler:
                 try:
                     payload = {
-                        "contract_id": self.config.contract_id,
+                        "contract_id": contract_id_str,
                         "order_id": str(order_id),
                         "status": status,
                         "side": side,
