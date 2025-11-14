@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-cn">
+<head>
+  <meta charset="UTF-8" />
+  <title>单节点协调面板</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    body {
+      margin: 0;
+      padding: 2rem clamp(1rem, 5vw, 3rem);
+      background: radial-gradient(circle at top left, rgba(59,130,246,0.2), transparent 45%), #0f172a;
+    }
+    h1 {
+      margin: 0 0 1.5rem;
+      font-size: clamp(1.5rem, 4vw, 2.5rem);
+    }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    button {
+      appearance: none;
+      border: none;
+      border-radius: 999px;
+      padding: 0.6rem 1.2rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 0.15s ease, box-shadow 0.15s ease, opacity 0.15s ease;
+    }
+    button:hover {
+      transform: translateY(-1px);
+    }
+    #pauseBtn {
+      background: linear-gradient(135deg, #f97316, #fb7185);
+      color: #0f172a;
+      box-shadow: 0 10px 24px rgba(251, 113, 133, 0.35);
+    }
+    #resumeBtn {
+      background: linear-gradient(135deg, #34d399, #10b981);
+      color: #022c22;
+      box-shadow: 0 10px 24px rgba(16, 185, 129, 0.35);
+    }
+    #refreshBtn {
+      background: rgba(148, 163, 184, 0.2);
+      color: #e2e8f0;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .card {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 14px;
+      padding: 1rem 1.2rem;
+      backdrop-filter: blur(12px);
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.35);
+    }
+    .card h2 {
+      margin: 0 0 0.6rem;
+      font-size: 0.9rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #94a3b8;
+    }
+    .value {
+      font-size: 1.6rem;
+      font-weight: 600;
+      word-break: break-word;
+    }
+    .reason {
+      margin-top: 0.45rem;
+      font-size: 0.85rem;
+      color: #facc15;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 12px;
+      overflow: hidden;
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(8px);
+    }
+    th, td {
+      padding: 0.7rem 0.9rem;
+      text-align: left;
+      font-size: 0.9rem;
+    }
+    th {
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      font-size: 0.75rem;
+      color: #94a3b8;
+      background: rgba(30, 41, 59, 0.85);
+    }
+    tbody tr:nth-child(every) {
+      background: rgba(148, 163, 184, 0.05);
+    }
+    tbody tr:nth-child(odd) {
+      background: rgba(148, 163, 184, 0.08);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 72px;
+      padding: 0.25rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .badge-run {
+      background: rgba(45, 212, 191, 0.16);
+      color: #5eead4;
+    }
+    .badge-pause {
+      background: rgba(248, 113, 113, 0.16);
+      color: #fca5a5;
+    }
+    footer {
+      margin-top: 2rem;
+      font-size: 0.75rem;
+      color: rgba(148, 163, 184, 0.6);
+      text-align: center;
+    }
+    @media (max-width: 600px) {
+      table {
+        font-size: 0.85rem;
+      }
+      th, td {
+        padding: 0.55rem 0.7rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>轻量协调中心</h1>
+  <div class="actions">
+    <button id="pauseBtn">全局暂停</button>
+    <button id="resumeBtn">恢复运行</button>
+    <button id="refreshBtn">手动刷新</button>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <h2>运行状态</h2>
+      <div class="value" id="mode">-</div>
+      <div class="reason" id="reason"></div>
+    </div>
+    <div class="card">
+      <h2>净持仓合计</h2>
+      <div class="value" id="total-position">-</div>
+    </div>
+    <div class="card">
+      <h2>成交量 (累计)</h2>
+      <div class="value" id="total-volume">-</div>
+    </div>
+    <div class="card">
+      <h2>余额合计</h2>
+      <div class="value" id="total-balance">-</div>
+      <div class="reason" id="total-value"></div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>VPS</th>
+        <th>别名</th>
+        <th>持仓</th>
+        <th>成交量</th>
+        <th>余额</th>
+        <th>总资产</th>
+        <th>上报时间</th>
+      </tr>
+    </thead>
+    <tbody id="agentTable">
+      <tr><td colspan="7" style="text-align:center;padding:1.5rem;color:#94a3b8;">暂无数据</td></tr>
+    </tbody>
+  </table>
+
+  <footer>此页面每 5 秒刷新一次，暂停/恢复操作需要 Basic Auth（若启用）。</footer>
+
+  <script>
+    const modeEl = document.getElementById('mode');
+    const reasonEl = document.getElementById('reason');
+    const totalPositionEl = document.getElementById('total-position');
+    const totalVolumeEl = document.getElementById('total-volume');
+    const totalBalanceEl = document.getElementById('total-balance');
+    const totalValueEl = document.getElementById('total-value');
+    const tableBody = document.getElementById('agentTable');
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch('/status', { credentials: 'include' });
+        if (!res.ok) {
+          throw new Error('状态请求失败');
+        }
+        const data = await res.json();
+        renderStatus(data);
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    function renderStatus(data) {
+      const isPaused = data.mode === 'PAUSE';
+      modeEl.textContent = data.mode === 'RUN' ? '运行中' : '已暂停';
+      modeEl.className = 'badge ' + (isPaused ? 'badge-pause' : 'badge-run');
+
+      if (data.reason) {
+        reasonEl.textContent = data.reason;
+        reasonEl.style.display = '';
+      } else {
+        reasonEl.textContent = '';
+        reasonEl.style.display = 'none';
+      }
+
+      const totals = data.totals || {};
+      totalPositionEl.textContent = totals.position ?? '-';
+      totalVolumeEl.textContent = totals.trading_volume ?? '-';
+      totalBalanceEl.textContent = totals.balance ?? '-';
+      totalValueEl.textContent = totals.total_value ? `总资产 ${totals.total_value}` : '';
+
+      const agents = Array.isArray(data.agents) ? data.agents : [];
+      if (agents.length === 0) {
+        tableBody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:1.5rem;color:#94a3b8;">等待节点注册…</td></tr>';
+        return;
+      }
+
+      const rows = agents.map(agent => {
+        const ts = agent.last_report_ts ? new Date(agent.last_report_ts * 1000).toLocaleString() : '-';
+        return `
+          <tr>
+            <td>${agent.vps_id}</td>
+            <td>${agent.display_name ?? '-'}</td>
+            <td>${agent.position ?? '-'}</td>
+            <td>${agent.trading_volume ?? '-'}</td>
+            <td>${agent.balance ?? '-'}</td>
+            <td>${agent.total_value ?? '-'}</td>
+            <td>${ts}</td>
+          </tr>
+        `;
+      });
+      tableBody.innerHTML = rows.join('');
+    }
+
+    async function postAction(url, reason) {
+      const body = reason ? { reason } : {};
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || '操作失败');
+      }
+      const data = await res.json();
+      renderStatus(data);
+    }
+
+    document.getElementById('pauseBtn').addEventListener('click', async () => {
+      const reason = prompt('暂停原因（可空）');
+      try {
+        await postAction('/manual_pause', reason);
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('resumeBtn').addEventListener('click', async () => {
+      const reason = prompt('恢复说明（可空）');
+      try {
+        await postAction('/manual_resume', reason);
+      } catch (err) {
+        alert(err.message);
+      }
+    });
+
+    document.getElementById('refreshBtn').addEventListener('click', () => {
+      fetchStatus();
+    });
+
+    fetchStatus();
+    setInterval(fetchStatus, 5000);
+  </script>
+</body>
+</html>

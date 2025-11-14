@@ -6,12 +6,17 @@ Modular Trading Bot - Supports multiple exchanges
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 import sys
-import dotenv
 from decimal import Decimal
 from trading_bot import TradingBot, TradingConfig
 from exchanges import ExchangeFactory
+
+try:  # python-dotenv is optional but recommended
+    import dotenv  # type: ignore
+except ImportError:  # pragma: no cover - runtime guard
+    dotenv = None  # type: ignore
 
 
 def parse_arguments():
@@ -49,6 +54,22 @@ def parse_arguments():
                         'Sell: pause if price <= pause-price. (default: -1, no pause)')
     parser.add_argument('--boost', action='store_true',
                         help='Use the Boost mode for volume boosting')
+
+    # Coordinator integration
+    parser.add_argument('--coordinator-url', type=str, default=None,
+                        help='Optional coordinator base URL (can also use COORDINATOR_URL env var)')
+    parser.add_argument('--coordinator-vps-id', type=str, default=None,
+                        help='Unique VPS identifier for coordinator (or COORDINATOR_VPS_ID env var)')
+    parser.add_argument('--coordinator-alias', type=str, default=None,
+                        help='Friendly display name for dashboard (or COORDINATOR_ALIAS env var)')
+    parser.add_argument('--coordinator-user', type=str, default=None,
+                        help='Coordinator basic auth username (or COORDINATOR_USER env var)')
+    parser.add_argument('--coordinator-password', type=str, default=None,
+                        help='Coordinator basic auth password (or COORDINATOR_PASSWORD env var)')
+    parser.add_argument('--coordinator-poll-interval', type=float, default=None,
+                        help='Seconds between command polls (default from config or COORDINATOR_POLL_INTERVAL)')
+    parser.add_argument('--coordinator-metrics-interval', type=float, default=None,
+                        help='Seconds between metrics pushes (default from config or COORDINATOR_METRICS_INTERVAL)')
 
     return parser.parse_args()
 
@@ -100,7 +121,43 @@ async def main():
     if not env_path.exists():
         print(f"Env file not find: {env_path.resolve()}")
         sys.exit(1)
+    if dotenv is None:
+        print("Error: python-dotenv is required. Install it with 'pip install python-dotenv'.")
+        sys.exit(1)
+
     dotenv.load_dotenv(args.env_file)
+
+    # Resolve coordinator configuration (CLI overrides env)
+    coordinator_url = args.coordinator_url or os.getenv("COORDINATOR_URL")
+    coordinator_vps_id = args.coordinator_vps_id or os.getenv("COORDINATOR_VPS_ID")
+    coordinator_alias = args.coordinator_alias or os.getenv("COORDINATOR_ALIAS")
+    coordinator_user = args.coordinator_user or os.getenv("COORDINATOR_USER")
+    coordinator_password = args.coordinator_password or os.getenv("COORDINATOR_PASSWORD")
+
+    default_poll_interval = TradingConfig.__dataclass_fields__['coordinator_poll_interval'].default
+    default_metrics_interval = TradingConfig.__dataclass_fields__['coordinator_metrics_interval'].default
+
+    poll_interval = args.coordinator_poll_interval
+    if poll_interval is None:
+        env_value = os.getenv("COORDINATOR_POLL_INTERVAL")
+        if env_value:
+            try:
+                poll_interval = float(env_value)
+            except ValueError:
+                print(f"Warning: invalid COORDINATOR_POLL_INTERVAL '{env_value}', using default {default_poll_interval}")
+    if poll_interval is None:
+        poll_interval = default_poll_interval
+
+    metrics_interval = args.coordinator_metrics_interval
+    if metrics_interval is None:
+        env_value = os.getenv("COORDINATOR_METRICS_INTERVAL")
+        if env_value:
+            try:
+                metrics_interval = float(env_value)
+            except ValueError:
+                print(f"Warning: invalid COORDINATOR_METRICS_INTERVAL '{env_value}', using default {default_metrics_interval}")
+    if metrics_interval is None:
+        metrics_interval = default_metrics_interval
 
     # Create configuration
     config = TradingConfig(
@@ -116,7 +173,14 @@ async def main():
         grid_step=Decimal(args.grid_step),
         stop_price=Decimal(args.stop_price),
         pause_price=Decimal(args.pause_price),
-        boost_mode=args.boost
+        boost_mode=args.boost,
+        coordinator_url=coordinator_url,
+        coordinator_vps_id=coordinator_vps_id,
+        coordinator_alias=coordinator_alias,
+        coordinator_user=coordinator_user,
+        coordinator_password=coordinator_password,
+        coordinator_poll_interval=poll_interval,
+        coordinator_metrics_interval=metrics_interval
     )
 
     # Create and run the bot

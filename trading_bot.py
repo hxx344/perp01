@@ -6,14 +6,24 @@ import os
 import time
 import asyncio
 import traceback
+import inspect
+from contextlib import suppress
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING, Literal, cast
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
 from helpers.lark_bot import LarkBot
 from helpers.telegram_bot import TelegramBot
+
+try:  # pragma: no cover - optional dependency for coordinator integration
+    import aiohttp  # type: ignore
+except ImportError:  # pragma: no cover
+    aiohttp = None  # type: ignore
+
+
+Action = Literal["RUN", "PAUSE"]
 
 
 @dataclass
@@ -32,6 +42,13 @@ class TradingConfig:
     stop_price: Decimal
     pause_price: Decimal
     boost_mode: bool
+    coordinator_url: Optional[str] = None
+    coordinator_vps_id: Optional[str] = None
+    coordinator_alias: Optional[str] = None
+    coordinator_user: Optional[str] = None
+    coordinator_password: Optional[str] = None
+    coordinator_poll_interval: float = 5.0
+    coordinator_metrics_interval: float = 15.0
 
     @property
     def close_order_side(self) -> str:
@@ -45,14 +62,14 @@ class OrderMonitor:
     order_id: Optional[str] = None
     filled: bool = False
     filled_price: Optional[Decimal] = None
-    filled_qty: Decimal = 0.0
+    filled_qty: Decimal = Decimal("0")
 
     def reset(self):
         """Reset the monitor state."""
         self.order_id = None
         self.filled = False
         self.filled_price = None
-        self.filled_qty = 0.0
+        self.filled_qty = Decimal("0")
 
 
 class TradingBot:
@@ -64,10 +81,11 @@ class TradingBot:
 
         # Create exchange client
         try:
-            self.exchange_client = ExchangeFactory.create_exchange(
+            client = ExchangeFactory.create_exchange(
                 config.exchange,
-                config
+                cast(Any, config)
             )
+            self.exchange_client = cast(Any, client)
         except ValueError as e:
             raise ValueError(f"Failed to create exchange client: {e}")
 
@@ -82,6 +100,31 @@ class TradingBot:
         self.shutdown_requested = False
         self.loop = None
 
+        # Coordinator integration
+        self.coordinator_enabled = bool(
+            self.config.coordinator_url and self.config.coordinator_vps_id
+        )
+        self._coordinator_base_url = (
+            self.config.coordinator_url.rstrip("/")
+            if self.config.coordinator_url
+            else None
+        )
+        self._coordinator_credentials = (
+            self.config.coordinator_user,
+            self.config.coordinator_password,
+        )
+        self._coordinator_session: Optional[Any] = None
+        self._coordinator_tasks: List[asyncio.Task] = []
+        self._coordinator_mode: Action = cast(Action, "RUN")
+        self._coordinator_reason: Optional[str] = None
+        self._coordinator_trade_volume = Decimal("0")
+        self._coordinator_pause_logged = False
+        self._command_poll_interval = max(self.config.coordinator_poll_interval or 5.0, 1.0)
+        self._metrics_interval = max(self.config.coordinator_metrics_interval or 15.0, 5.0)
+        self._coordinator_auth = None
+
+        self.order_filled_amount = Decimal("0")
+
         # Register order callback
         self._setup_websocket_handlers()
 
@@ -91,6 +134,7 @@ class TradingBot:
         self.shutdown_requested = True
 
         try:
+            await self._shutdown_coordinator()
             # Disconnect from exchange
             await self.exchange_client.disconnect()
             self.logger.log("Graceful shutdown completed", "INFO")
@@ -116,6 +160,7 @@ class TradingBot:
                     self.current_order_status = status
 
                 if status == 'FILLED':
+                    self._record_trade_volume(filled_size, message.get('price'))
                     if order_type == "OPEN":
                         self.order_filled_amount = filled_size
                         # Ensure thread-safe interaction with asyncio event loop
@@ -160,7 +205,212 @@ class TradingBot:
         # Setup order update handler
         self.exchange_client.setup_order_update_handler(order_update_handler)
 
-    def _calculate_wait_time(self) -> Decimal:
+    @staticmethod
+    def _safe_decimal_or_none(value: Any) -> Optional[Decimal]:
+        try:
+            if value is None:
+                return None
+            return Decimal(str(value))
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+        parsed = TradingBot._safe_decimal_or_none(value)
+        return parsed if parsed is not None else default
+
+    def _record_trade_volume(self, quantity: Any, price: Any) -> None:
+        if not self.coordinator_enabled:
+            return
+        qty = self._safe_decimal_or_none(quantity)
+        px = self._safe_decimal_or_none(price)
+        if qty is None or px is None:
+            return
+        self._coordinator_trade_volume += qty * px
+
+    async def _ensure_coordinator_session(self) -> Optional[Any]:
+        if not self.coordinator_enabled or self._coordinator_base_url is None:
+            return None
+        if aiohttp is None:
+            self.logger.log("aiohttp 未安装，协调机功能已禁用", "WARNING")
+            self.coordinator_enabled = False
+            return None
+        if self._coordinator_session is None or getattr(self._coordinator_session, "closed", False):
+            timeout = aiohttp.ClientTimeout(total=10)
+            self._coordinator_session = aiohttp.ClientSession(timeout=timeout)
+            user, password = self._coordinator_credentials
+            if user:
+                self._coordinator_auth = aiohttp.BasicAuth(user, password or "")
+        return self._coordinator_session
+
+    async def _coordinator_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
+        session = await self._ensure_coordinator_session()
+        if session is None:
+            return None
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"{self._coordinator_base_url}{path}"
+        try:
+            async with session.request(
+                method,
+                url,
+                auth=self._coordinator_auth,
+                params=params,
+                json=json,
+            ) as response:
+                if response.status >= 400:
+                    text = await response.text()
+                    raise RuntimeError(f"{method} {path} -> {response.status}: {text}")
+                content_type = response.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    return await response.json()
+                return await response.text()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.log(f"协调机请求异常 {method} {path}: {exc}", "WARNING")
+            return None
+
+    async def _init_coordinator(self) -> None:
+        if not self.coordinator_enabled:
+            return
+        payload = {"vps_id": self.config.coordinator_vps_id}
+        if self.config.coordinator_alias:
+            payload["display_name"] = self.config.coordinator_alias
+        response = await self._coordinator_request("POST", "/register", json=payload)
+        if not isinstance(response, dict):
+            self.logger.log("无法注册协调机，功能已禁用", "WARNING")
+            await self._shutdown_coordinator(disable=True)
+            return
+        action = str(response.get("mode") or response.get("action") or "RUN").upper()
+        if action not in {"RUN", "PAUSE"}:
+            action = "RUN"
+        self._coordinator_mode = cast(Action, action)
+        self._coordinator_reason = response.get("reason") if isinstance(response.get("reason"), str) else None
+        self.logger.log(
+            f"已连接协调机，当前模式: {self._coordinator_mode}"
+            + (f", 原因: {self._coordinator_reason}" if self._coordinator_reason else ""),
+            "INFO",
+        )
+
+    def _start_coordinator_tasks(self) -> None:
+        if not self.coordinator_enabled:
+            return
+        self._coordinator_tasks.append(asyncio.create_task(self._poll_coordinator_commands()))
+        self._coordinator_tasks.append(asyncio.create_task(self._push_coordinator_metrics()))
+
+    async def _poll_coordinator_commands(self) -> None:
+        while not self.shutdown_requested and self.coordinator_enabled:
+            data = await self._coordinator_request(
+                "GET",
+                "/command",
+                params={"vps_id": self.config.coordinator_vps_id},
+            )
+            if isinstance(data, dict):
+                action = str(data.get("action", "RUN")).upper()
+                if action not in {"RUN", "PAUSE"}:
+                    action = "RUN"
+                reason = data.get("reason") if isinstance(data.get("reason"), str) else None
+                if action != self._coordinator_mode:
+                    self._coordinator_mode = cast(Action, action)
+                    self._coordinator_reason = reason
+                    self._coordinator_pause_logged = False
+                    level = "WARNING" if action == "PAUSE" else "INFO"
+                    message = "协调机指令: 暂停交易" if action == "PAUSE" else "协调机指令: 恢复交易"
+                    if reason:
+                        message += f"，原因: {reason}"
+                    self.logger.log(message, level)
+            await asyncio.sleep(self._command_poll_interval)
+
+    async def _build_coordinator_metrics_payload(self) -> Optional[Dict[str, Any]]:
+        if not self.coordinator_enabled:
+            return None
+        try:
+            position = await self.exchange_client.get_account_positions()
+        except Exception as exc:
+            self.logger.log(f"获取仓位失败（协调机上报将使用0）: {exc}", "WARNING")
+            position = Decimal("0")
+
+        balance = Decimal("0")
+        total_value: Optional[Decimal] = None
+        metrics_getter = getattr(self.exchange_client, "get_account_metrics", None)
+        if callable(metrics_getter):
+            try:
+                metrics_result = metrics_getter()
+                if inspect.isawaitable(metrics_result):
+                    account_metrics = await metrics_result
+                else:
+                    account_metrics = metrics_result
+                if isinstance(account_metrics, dict):
+                    balance = self._safe_decimal(
+                        account_metrics.get("available_balance")
+                        or account_metrics.get("availableBalance")
+                        or account_metrics.get("balance"),
+                        default=balance,
+                    )
+                    total_value_candidate = (
+                        account_metrics.get("total_account_value")
+                        or account_metrics.get("total_asset_value")
+                        or account_metrics.get("total_value")
+                    )
+                    total_candidate_decimal = self._safe_decimal_or_none(total_value_candidate)
+                    if total_candidate_decimal is not None:
+                        total_value = total_candidate_decimal
+            except Exception as exc:
+                self.logger.log(f"获取账户指标失败: {exc}", "WARNING")
+
+        balance_getter = getattr(self.exchange_client, "get_available_balance", None)
+        if callable(balance_getter):
+            try:
+                balance_result = balance_getter()
+                if inspect.isawaitable(balance_result):
+                    balance_result = await balance_result
+                balance = self._safe_decimal(balance_result, default=balance)
+            except Exception as exc:
+                self.logger.log(f"获取余额失败: {exc}", "WARNING")
+
+        payload: Dict[str, Any] = {
+            "vps_id": self.config.coordinator_vps_id,
+            "position": str(position),
+            "trading_volume": str(self._coordinator_trade_volume),
+            "balance": str(balance),
+            "total_value": str(total_value) if total_value is not None else None,
+            "timestamp": time.time(),
+        }
+        return payload
+
+    async def _push_coordinator_metrics(self) -> None:
+        while not self.shutdown_requested and self.coordinator_enabled:
+            payload = await self._build_coordinator_metrics_payload()
+            if payload is not None:
+                await self._coordinator_request("POST", "/metrics", json=payload)
+            await asyncio.sleep(self._metrics_interval)
+
+    async def _shutdown_coordinator(self, *, disable: bool = False) -> None:
+        for task in self._coordinator_tasks:
+            task.cancel()
+        for task in self._coordinator_tasks:
+            with suppress(asyncio.CancelledError):
+                await task
+        self._coordinator_tasks.clear()
+        if self._coordinator_session is not None:
+            try:
+                await self._coordinator_session.close()
+            except Exception:
+                pass
+        self._coordinator_session = None
+        self._coordinator_auth = None
+        if disable:
+            self.coordinator_enabled = False
+
+    def _calculate_wait_time(self) -> int:
         """Calculate wait time between orders."""
         cool_down_time = self.config.wait_time
 
@@ -196,7 +446,7 @@ class TradingBot:
             # Reset state before placing order
             self.order_filled_event.clear()
             self.current_order_status = 'OPEN'
-            self.order_filled_amount = 0.0
+            self.order_filled_amount = Decimal("0")
 
             # Place the order
             order_result = await self.exchange_client.place_open_order(
@@ -540,7 +790,7 @@ class TradingBot:
         else:
             return True
 
-    async def _check_price_condition(self) -> bool:
+    async def _check_price_condition(self) -> Tuple[bool, bool]:
         stop_trading = False
         pause_trading = False
 
@@ -610,8 +860,22 @@ class TradingBot:
             # wait for connection to establish
             await asyncio.sleep(5)
 
+            if self.coordinator_enabled:
+                await self._init_coordinator()
+                if self.coordinator_enabled:
+                    self._start_coordinator_tasks()
+
             # Main trading loop
             while not self.shutdown_requested:
+                if self.coordinator_enabled and self._coordinator_mode == "PAUSE":
+                    if not self._coordinator_pause_logged:
+                        pause_reason = self._coordinator_reason or "协调机未提供原因"
+                        self.logger.log(f"协调机暂停中，等待恢复（原因：{pause_reason}）", "WARNING")
+                        self._coordinator_pause_logged = True
+                    await asyncio.sleep(self._command_poll_interval)
+                    continue
+                self._coordinator_pause_logged = False
+
                 # Update active orders
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
 
@@ -665,6 +929,11 @@ class TradingBot:
             await self.graceful_shutdown(f"Critical error: {e}")
             raise
         finally:
+            try:
+                await self._shutdown_coordinator()
+            except Exception as e:
+                self.logger.log(f"Error shutting down coordinator: {e}", "ERROR")
+
             # Ensure all connections are closed even if graceful shutdown fails
             try:
                 await self.exchange_client.disconnect()

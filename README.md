@@ -391,6 +391,20 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
 - `APEX_API_KEY_SECRET`: 您的 Apex API 密钥私钥
 - `APEX_OMNI_KEY_SEED`: 您的 Apex Omni 密钥种子
 
+#### 协调器（Coordinator）配置（可选）
+
+> 仅当你启用了协调器服务时需要设置下列变量。
+
+- `COORDINATOR_URL`: 协调器服务的 HTTP 基地址（例如 `http://127.0.0.1:8787`）。
+- `COORDINATOR_VPS_ID`: 当前 VPS / 机器人实例的唯一标识，用于在面板中区分节点。
+- `COORDINATOR_ALIAS`: 可读名称，展示在控制面板里。
+- `COORDINATOR_USER`: 若启用基础认证，访问协调器所需的用户名。
+- `COORDINATOR_PASSWORD`: 若启用基础认证，访问协调器所需的密码。
+- `COORDINATOR_POLL_INTERVAL`: 轮询协调器命令的频率（秒，默认 5）。
+- `COORDINATOR_METRICS_INTERVAL`: 上报仓位/余额/交易额的频率（秒，默认 15）。
+
+这些变量都可以被同名的 `runbot.py` CLI 选项覆盖，例如 `--coordinator-url` 或 `--coordinator-vps-id`。
+
 **获取 LIGHTER_ACCOUNT_INDEX 的方法**：
 
 1. 在下面的网址最后加上你的钱包地址：
@@ -398,6 +412,27 @@ python hedge_mode.py --exchange edgex --ticker BTC --size 0.001 --iter 20
    ```
    https://mainnet.zklighter.elliot.ai/api/v1/account?by=l1_address&value=
    ```
+
+### 协调器服务使用指南（可选）
+
+1. **启动服务**：在任意服务器上运行协调器（默认端口 8787）。
+
+   ```bash
+   python -m perp01.services.coordinator --host 0.0.0.0 --port 8787 --dashboard-user admin --dashboard-password yourpass
+   ```
+
+2. **访问控制台**：浏览器打开 `http://<host>:8787/dashboard`。若设置了用户名/密码，需要在浏览器或 API 请求里提供 Basic Auth。
+
+3. **连接交易机器人**：在启动 `runbot.py` 时通过 CLI 或环境变量提供协调器参数，例如：
+
+   ```bash
+   python runbot.py --exchange lighter --ticker ETH --quantity 0.5 --take-profit 0.02 \
+     --coordinator-url http://coordinator.local:8787 \
+     --coordinator-vps-id sg-node-01 \
+     --coordinator-alias "新加坡 VPS"
+   ```
+
+   只要提供了 `URL + VPS_ID`，机器人就会每隔数秒轮询暂停/恢复指令，并自动上报持仓、账户余额和累计交易额。
 
 2. 在浏览器中打开这个网址
 
