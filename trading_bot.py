@@ -338,6 +338,32 @@ class TradingBot:
             self.logger.log(f"获取仓位失败（协调机上报将使用0）: {exc}", "WARNING")
             position = Decimal("0")
 
+        position_symbol: Optional[str] = None
+        position_value: Optional[Decimal] = None
+        position_snapshot_method = getattr(self.exchange_client, "get_position_snapshot", None)
+        if callable(position_snapshot_method):
+            try:
+                snapshot_result = position_snapshot_method()
+                if inspect.isawaitable(snapshot_result):
+                    snapshot = await snapshot_result
+                else:
+                    snapshot = snapshot_result
+                if isinstance(snapshot, dict):
+                    symbol_candidate = snapshot.get("symbol") or snapshot.get("position_symbol")
+                    if isinstance(symbol_candidate, str) and symbol_candidate.strip():
+                        position_symbol = symbol_candidate.strip()
+
+                    value_candidate = (
+                        snapshot.get("value")
+                        or snapshot.get("position_value")
+                        or snapshot.get("notional")
+                    )
+                    value_decimal = self._safe_decimal_or_none(value_candidate)
+                    if value_decimal is not None:
+                        position_value = value_decimal
+            except Exception as exc:
+                self.logger.log(f"获取仓位详情失败: {exc}", "WARNING")
+
         balance = Decimal("0")
         total_value: Optional[Decimal] = None
         metrics_getter = getattr(self.exchange_client, "get_account_metrics", None)
@@ -384,6 +410,10 @@ class TradingBot:
             "total_value": str(total_value) if total_value is not None else None,
             "timestamp": time.time(),
         }
+        if position_symbol:
+            payload["position_symbol"] = position_symbol
+        if position_value is not None:
+            payload["position_value"] = str(position_value)
         return payload
 
     async def _push_coordinator_metrics(self) -> None:

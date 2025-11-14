@@ -544,6 +544,33 @@ class LighterClient(BaseExchangeClient):
 
         return Decimal(0)
 
+    async def get_position_snapshot(self) -> Optional[Dict[str, Any]]:
+        """Return symbol, size and notional value for the current market position."""
+        account_details = await self._fetch_account_details()
+        symbol = getattr(self.config, "ticker", None)
+
+        for position in getattr(account_details, "positions", []):
+            if position.market_id != self.config.contract_id:
+                continue
+
+            size = self._safe_decimal(getattr(position, "position", None))
+            value = self._safe_decimal(getattr(position, "position_value", None))
+            symbol = getattr(position, "symbol", symbol)
+
+            return {
+                "symbol": symbol,
+                "size": size,
+                "value": value,
+            }
+
+        if symbol is None:
+            return None
+        return {
+            "symbol": symbol,
+            "size": Decimal("0"),
+            "value": Decimal("0"),
+        }
+
     async def get_account_metrics(self) -> Dict[str, Decimal]:
         """Return balance and total account value for coordinator metrics."""
         account_details = await self._fetch_account_details()

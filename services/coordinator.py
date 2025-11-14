@@ -53,6 +53,8 @@ class VPSState:
     vps_id: str
     display_name: Optional[str] = None
     position: Decimal = Decimal("0")
+    position_symbol: Optional[str] = None
+    position_value: Optional[Decimal] = None
     trading_volume: Decimal = Decimal("0")
     balance: Decimal = Decimal("0")
     total_value: Optional[Decimal] = None
@@ -63,6 +65,8 @@ class VPSState:
             "vps_id": self.vps_id,
             "display_name": self.display_name,
             "position": str(self.position),
+            "position_symbol": self.position_symbol,
+            "position_value": str(self.position_value) if self.position_value is not None else None,
             "trading_volume": str(self.trading_volume),
             "balance": str(self.balance),
             "total_value": str(self.total_value) if self.total_value is not None else None,
@@ -105,6 +109,8 @@ class CoordinatorState:
         *,
         vps_id: str,
         position: Decimal,
+        position_symbol: Optional[str],
+        position_value: Optional[Decimal],
         trading_volume: Decimal,
         balance: Decimal,
         total_value: Optional[Decimal],
@@ -115,6 +121,8 @@ class CoordinatorState:
                 raise web.HTTPNotFound(text=f"vps '{vps_id}' is not registered")
             state = self._agents[vps_id]
             state.position = position
+            state.position_symbol = position_symbol
+            state.position_value = position_value
             state.trading_volume = trading_volume
             state.balance = balance
             state.total_value = total_value
@@ -157,15 +165,20 @@ class CoordinatorState:
     def _status_locked(self) -> Dict[str, Any]:
         totals = {
             "position": Decimal("0"),
+            "position_value": Decimal("0"),
             "trading_volume": Decimal("0"),
             "balance": Decimal("0"),
             "total_value": Decimal("0"),
+            "has_position_value": False,
             "has_total_value": False,
         }
         agents_snapshot = []
         for agent in self._agents.values():
             agents_snapshot.append(agent.as_payload())
             totals["position"] += agent.position
+            if agent.position_value is not None:
+                totals["position_value"] += agent.position_value
+                totals["has_position_value"] = True
             totals["trading_volume"] += agent.trading_volume
             totals["balance"] += agent.balance
             if agent.total_value is not None:
@@ -179,6 +192,7 @@ class CoordinatorState:
             "agents": agents_snapshot,
             "totals": {
                 "position": str(totals["position"]),
+                "position_value": str(totals["position_value"]) if totals["has_position_value"] else None,
                 "trading_volume": str(totals["trading_volume"]),
                 "balance": str(totals["balance"]),
                 "total_value": str(totals["total_value"]) if totals["has_total_value"] else None,
@@ -239,15 +253,22 @@ class CoordinatorApp:
             raise web.HTTPBadRequest(text="vps_id required")
 
         position = _to_decimal(payload.get("position"))
+        position_symbol = payload.get("position_symbol")
+        if position_symbol is not None and not isinstance(position_symbol, str):
+            raise web.HTTPBadRequest(text="position_symbol must be string when provided")
         trading_volume = _to_decimal(payload.get("trading_volume"))
         balance = _to_decimal(payload.get("balance"))
         total_value_raw = payload.get("total_value")
         total_value = _to_decimal(total_value_raw) if total_value_raw is not None else None
+        position_value_raw = payload.get("position_value")
+        position_value = _to_decimal(position_value_raw) if position_value_raw is not None else None
         timestamp = float(payload.get("timestamp", time.time()))
 
         status = await self.state.update_metrics(
             vps_id=vps_id,
             position=position,
+            position_symbol=position_symbol,
+            position_value=position_value,
             trading_volume=trading_volume,
             balance=balance,
             total_value=total_value,

@@ -165,6 +165,10 @@
       <div class="value" id="total-position">-</div>
     </div>
     <div class="card">
+      <h2>持仓价值合计</h2>
+      <div class="value" id="total-position-value">-</div>
+    </div>
+    <div class="card">
       <h2>成交量 (累计)</h2>
       <div class="value" id="total-volume">-</div>
     </div>
@@ -181,6 +185,8 @@
         <th>VPS</th>
         <th>别名</th>
         <th>持仓</th>
+        <th>品种</th>
+        <th>持仓价值</th>
         <th>成交量</th>
         <th>余额</th>
         <th>总资产</th>
@@ -198,6 +204,7 @@
     const modeEl = document.getElementById('mode');
     const reasonEl = document.getElementById('reason');
     const totalPositionEl = document.getElementById('total-position');
+    const totalPositionValueEl = document.getElementById('total-position-value');
     const totalVolumeEl = document.getElementById('total-volume');
     const totalBalanceEl = document.getElementById('total-balance');
     const totalValueEl = document.getElementById('total-value');
@@ -231,13 +238,14 @@
 
       const totals = data.totals || {};
       totalPositionEl.textContent = totals.position ?? '-';
+       totalPositionValueEl.textContent = totals.position_value ?? '-';
       totalVolumeEl.textContent = totals.trading_volume ?? '-';
       totalBalanceEl.textContent = totals.balance ?? '-';
       totalValueEl.textContent = totals.total_value ? `总资产 ${totals.total_value}` : '';
 
       const agents = Array.isArray(data.agents) ? data.agents : [];
       if (agents.length === 0) {
-        tableBody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:1.5rem;color:#94a3b8;">等待节点注册…</td></tr>';
+        tableBody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:1.5rem;color:#94a3b8;">等待节点注册…</td></tr>';
         return;
       }
 
@@ -248,6 +256,8 @@
             <td>${agent.vps_id}</td>
             <td>${agent.display_name ?? '-'}</td>
             <td>${agent.position ?? '-'}</td>
+            <td>${agent.position_symbol ?? '-'}</td>
+            <td>${agent.position_value ?? '-'}</td>
             <td>${agent.trading_volume ?? '-'}</td>
             <td>${agent.balance ?? '-'}</td>
             <td>${agent.total_value ?? '-'}</td>
