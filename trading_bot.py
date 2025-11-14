@@ -122,6 +122,9 @@ class TradingBot:
         self._command_poll_interval = max(self.config.coordinator_poll_interval or 5.0, 1.0)
         self._metrics_interval = max(self.config.coordinator_metrics_interval or 15.0, 5.0)
         self._coordinator_auth = None
+        self._last_mismatch_alert_state = None
+        self._mismatch_notified_state = None
+        self._manual_balance_lock = asyncio.Lock()
 
         self.order_filled_amount = Decimal("0")
 
@@ -228,6 +231,154 @@ class TradingBot:
             return
         self._coordinator_trade_volume += qty * px
 
+    def _prepare_close_orders(self, orders: List[Any]) -> Tuple[List[Dict[str, Any]], Decimal]:
+        close_orders: List[Dict[str, Any]] = []
+        total = Decimal("0")
+        for order in orders:
+            if order.side != self.config.close_order_side:
+                continue
+            size_decimal = self._safe_decimal(order.size)
+            close_orders.append({
+                "id": order.order_id,
+                "price": order.price,
+                "size": size_decimal,
+            })
+            total += size_decimal
+        return close_orders, total
+
+    def _classify_mismatch_severity(self, mismatch_amount: Decimal) -> Optional[str]:
+        warning_threshold = self.config.quantity * Decimal("2")
+        critical_threshold = self.config.quantity * Decimal("4")
+        if mismatch_amount > critical_threshold:
+            return "critical"
+        if mismatch_amount > warning_threshold:
+            return "warning"
+        return None
+
+    def _format_mismatch_message(
+        self,
+        severity: str,
+        position_amt: Decimal,
+        active_close_amount: Decimal,
+        mismatch_amount: Decimal,
+    ) -> str:
+        label = "ERROR" if severity == "critical" else "WARNING"
+        header = f"\n\n{label}: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] Position mismatch detected\n"
+        body = "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
+        body += "Please manually rebalance your position and take-profit orders\n"
+        body += "请手动平衡当前仓位和正在关闭的仓位\n"
+        body += (
+            f"current position: {position_amt} | active closing amount: {active_close_amount} | "
+            f"Order quantity: {len(self.active_close_orders)}\n"
+            f"difference: {mismatch_amount}\n"
+        )
+        body += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
+        return header + body
+
+    async def _report_mismatch_alert(
+        self,
+        *,
+        severity: str,
+        position: Decimal,
+        active_close: Decimal,
+        mismatch: Decimal,
+    ) -> None:
+        if not self.coordinator_enabled or not self.config.coordinator_vps_id:
+            return
+        message = (
+            f"Position {position} vs closing {active_close} (diff {mismatch})"
+            if severity != "resolved"
+            else "Position mismatch resolved"
+        )
+        payload = {
+            "vps_id": self.config.coordinator_vps_id,
+            "type": "position_mismatch",
+            "severity": severity,
+            "message": message,
+            "symbol": self.config.ticker,
+            "position": str(position),
+            "active_closing_amount": str(active_close),
+            "difference": str(mismatch),
+            "timestamp": time.time(),
+        }
+        await self._coordinator_request("POST", "/alerts", json=payload)
+
+    async def _update_mismatch_alert_state(
+        self,
+        *,
+        severity: Optional[str],
+        position: Decimal,
+        active_close: Decimal,
+        mismatch: Decimal,
+    ) -> None:
+        if not self.coordinator_enabled or not self.config.coordinator_vps_id:
+            self._last_mismatch_alert_state = severity
+            return
+
+        if severity is None:
+            if self._last_mismatch_alert_state is not None:
+                await self._report_mismatch_alert(
+                    severity="resolved",
+                    position=position,
+                    active_close=active_close,
+                    mismatch=mismatch,
+                )
+            self._last_mismatch_alert_state = None
+            return
+
+        if severity != self._last_mismatch_alert_state:
+            await self._report_mismatch_alert(
+                severity=severity,
+                position=position,
+                active_close=active_close,
+                mismatch=mismatch,
+            )
+            self._last_mismatch_alert_state = severity
+
+    async def _perform_manual_balance(self, payload: Dict[str, Any]) -> None:
+        async with self._manual_balance_lock:
+            reason = payload.get("reason")
+            reason_text = (
+                f"（原因：{reason}）" if isinstance(reason, str) and reason.strip() else ""
+            )
+            self.logger.log(f"收到协调机手动平衡指令{reason_text}", "WARNING")
+            try:
+                active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                self.active_close_orders, active_close_amount = self._prepare_close_orders(active_orders)
+                position_amt = await self.exchange_client.get_account_positions()
+
+                adjusted = await self._attempt_auto_balance(position_amt, active_close_amount)
+                if adjusted:
+                    await asyncio.sleep(3)
+                    refreshed_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+                    self.active_close_orders, active_close_amount = self._prepare_close_orders(refreshed_orders)
+                    position_amt = await self.exchange_client.get_account_positions()
+                    mismatch_amount = abs(abs(position_amt) - active_close_amount)
+                    severity = self._classify_mismatch_severity(mismatch_amount)
+                    await self._update_mismatch_alert_state(
+                        severity=severity,
+                        position=position_amt,
+                        active_close=active_close_amount,
+                        mismatch=mismatch_amount,
+                    )
+                    self.logger.log("手动平衡已执行，已刷新仓位数据", "INFO")
+                else:
+                    mismatch_amount = abs(abs(position_amt) - active_close_amount)
+                    severity = self._classify_mismatch_severity(mismatch_amount)
+                    await self._update_mismatch_alert_state(
+                        severity=severity,
+                        position=position_amt,
+                        active_close=active_close_amount,
+                        mismatch=mismatch_amount,
+                    )
+                    self.logger.log("手动平衡无需调整（仓位与平仓单匹配）", "INFO")
+            except Exception as exc:
+                self.logger.log(f"手动平衡失败: {exc}", "ERROR")
+                self.logger.log(f"Traceback: {traceback.format_exc()}", "ERROR")
+            finally:
+                # Force下一轮日志快速刷新，以便尽快复检仓位状态
+                self.last_log_time = 0
+
     async def _ensure_coordinator_session(self) -> Optional[Any]:
         if not self.coordinator_enabled or self._coordinator_base_url is None:
             return None
@@ -327,6 +478,10 @@ class TradingBot:
                     if reason:
                         message += f"，原因: {reason}"
                     self.logger.log(message, level)
+                actions_payload = data.get("actions")
+                if isinstance(actions_payload, list) and actions_payload:
+                    for action_payload in actions_payload:
+                        asyncio.create_task(self._handle_coordinator_action(action_payload))
             await asyncio.sleep(self._command_poll_interval)
 
     async def _build_coordinator_metrics_payload(self) -> Optional[Dict[str, Any]]:
@@ -422,6 +577,15 @@ class TradingBot:
             if payload is not None:
                 await self._coordinator_request("POST", "/metrics", json=payload)
             await asyncio.sleep(self._metrics_interval)
+
+    async def _handle_coordinator_action(self, payload: Dict[str, Any]) -> None:
+        try:
+            action_type = str(payload.get("type", "")).upper()
+        except Exception:
+            return
+
+        if action_type == "MANUAL_BALANCE":
+            await self._perform_manual_balance(payload)
 
     async def _shutdown_coordinator(self, *, disable: bool = False) -> None:
         for task in self._coordinator_tasks:
@@ -648,22 +812,8 @@ class TradingBot:
                 # Get active orders
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
 
-                def prepare_close_orders(orders):
-                    close_orders = []
-                    total = Decimal('0')
-                    for o in orders:
-                        if o.side == self.config.close_order_side:
-                            size = Decimal(o.size)
-                            close_orders.append({
-                                'id': o.order_id,
-                                'price': o.price,
-                                'size': size
-                            })
-                            total += size
-                    return close_orders, total
-
                 # Filter close orders
-                self.active_close_orders, active_close_amount = prepare_close_orders(active_orders)
+                self.active_close_orders, active_close_amount = self._prepare_close_orders(active_orders)
 
                 # Get positions
                 position_amt = await self.exchange_client.get_account_positions()
@@ -677,9 +827,12 @@ class TradingBot:
                 if lower_threshold < mismatch_amount <= upper_threshold:
                     auto_balanced = await self._attempt_auto_balance(position_amt, active_close_amount)
                     if auto_balanced:
+                        # Give exchange a moment to reflect newly submitted orders
+                        await asyncio.sleep(3)
+
                         # Refresh orders and positions after balancing attempt
                         active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-                        self.active_close_orders, active_close_amount = prepare_close_orders(active_orders)
+                        self.active_close_orders, active_close_amount = self._prepare_close_orders(active_orders)
                         position_amt = await self.exchange_client.get_account_positions()
                         position_abs = abs(position_amt)
                         mismatch_amount = abs(position_abs - active_close_amount)
@@ -688,24 +841,33 @@ class TradingBot:
                                 f"Order quantity: {len(self.active_close_orders)}")
                 self.last_log_time = time.time()
                 # Check for position mismatch
-                if mismatch_amount > (2 * self.config.quantity):
-                    error_message = f"\n\nERROR: [{self.config.exchange.upper()}_{self.config.ticker.upper()}] "
-                    error_message += "Position mismatch detected\n"
-                    error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                    error_message += "Please manually rebalance your position and take-profit orders\n"
-                    error_message += "请手动平衡当前仓位和正在关闭的仓位\n"
-                    error_message += f"current position: {position_amt} | active closing amount: {active_close_amount} | "f"Order quantity: {len(self.active_close_orders)}\n"
-                    error_message += "###### ERROR ###### ERROR ###### ERROR ###### ERROR #####\n"
-                    self.logger.log(error_message, "ERROR")
-
-                    await self.send_notification(error_message.lstrip())
-
-                    if not self.shutdown_requested:
-                        self.shutdown_requested = True
-
-                    mismatch_detected = True
+                severity = self._classify_mismatch_severity(mismatch_amount)
+                if severity in {"warning", "critical"}:
+                    message = self._format_mismatch_message(
+                        severity,
+                        position_amt,
+                        active_close_amount,
+                        mismatch_amount,
+                    )
+                    log_level = "ERROR" if severity == "critical" else "WARNING"
+                    self.logger.log(message, log_level)
+                    if severity == "critical" and self._mismatch_notified_state != "critical":
+                        await self.send_notification(message.lstrip())
+                        self._mismatch_notified_state = "critical"
+                    elif severity == "warning" and self._mismatch_notified_state != "warning":
+                        self._mismatch_notified_state = "warning"
                 else:
-                    mismatch_detected = False
+                    if self._mismatch_notified_state is not None:
+                        self._mismatch_notified_state = None
+
+                await self._update_mismatch_alert_state(
+                    severity=severity,
+                    position=position_amt,
+                    active_close=active_close_amount,
+                    mismatch=mismatch_amount,
+                )
+
+                mismatch_detected = severity is not None
 
                 return mismatch_detected
 

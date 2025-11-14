@@ -59,6 +59,7 @@ class VPSState:
     balance: Decimal = Decimal("0")
     total_value: Optional[Decimal] = None
     last_report_ts: float = field(default_factory=lambda: 0.0)
+    alerts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def as_payload(self) -> Dict[str, Any]:
         return {
@@ -71,6 +72,7 @@ class VPSState:
             "balance": str(self.balance),
             "total_value": str(self.total_value) if self.total_value is not None else None,
             "last_report_ts": self.last_report_ts,
+            "alerts": [dict(alert) for alert in self.alerts.values()],
         }
 
 
@@ -84,6 +86,7 @@ class CoordinatorState:
         self._reason: Optional[str] = None
         self._last_transition: float = time.time()
         self._agent_overrides: Dict[str, Dict[str, Any]] = {}
+        self._agent_actions: Dict[str, List[Dict[str, Any]]] = {}
 
     # ------------------------------------------------------------------
     # Registration & inspection helpers
@@ -137,16 +140,95 @@ class CoordinatorState:
             )
             return self._status_locked()
 
+    async def set_alert(
+        self,
+        *,
+        vps_id: str,
+        alert_type: str,
+        severity: str,
+        message: Optional[str],
+        details: Dict[str, Any],
+        timestamp: float,
+    ) -> Dict[str, Any]:
+        async with self._lock:
+            if vps_id not in self._agents:
+                raise web.HTTPNotFound(text=f"vps '{vps_id}' is not registered")
+            state = self._agents[vps_id]
+            normalized_type = alert_type or "general"
+            normalized_severity = severity.lower()
+            record: Dict[str, Any] = {
+                "type": normalized_type,
+                "severity": normalized_severity,
+                "message": message,
+                "timestamp": timestamp,
+            }
+            if details:
+                record["details"] = {
+                    key: str(value)
+                    for key, value in details.items()
+                    if value is not None
+                }
+
+            if normalized_severity in {"resolved", "clear"}:
+                state.alerts.pop(normalized_type, None)
+                LOGGER.info("Cleared alert %s for %s", normalized_type, vps_id)
+            else:
+                state.alerts[normalized_type] = record
+                LOGGER.warning(
+                    "Alert %s (%s) recorded for %s: %s",
+                    normalized_type,
+                    normalized_severity,
+                    vps_id,
+                    message,
+                )
+            return self._status_locked()
+
+    async def enqueue_action(
+        self,
+        *,
+        action_type: str,
+        reason: Optional[str],
+        target_vps_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        async with self._lock:
+            targets = list(target_vps_ids) if target_vps_ids else list(self._agents.keys())
+            if not targets:
+                raise web.HTTPBadRequest(text="no registered agents to target")
+            now = time.time()
+            queued: List[str] = []
+            for vps_id in targets:
+                if vps_id not in self._agents:
+                    LOGGER.warning("Attempted to queue action for unknown VPS %s", vps_id)
+                    continue
+                payload = {
+                    "type": action_type.upper(),
+                    "reason": reason,
+                    "timestamp": now,
+                }
+                self._agent_actions.setdefault(vps_id, []).append(payload)
+                queued.append(vps_id)
+            if queued:
+                LOGGER.warning(
+                    "Queued action %s for: %s",
+                    action_type,
+                    ", ".join(queued),
+                )
+            return self._status_locked()
+
     async def next_command(self, *, vps_id: str) -> Dict[str, Any]:
         async with self._lock:
             if vps_id not in self._agents:
                 raise web.HTTPNotFound(text=f"vps '{vps_id}' is not registered")
             override = self._agent_overrides.get(vps_id)
+            actions = self._agent_actions.get(vps_id, [])
+            if actions:
+                self._agent_actions[vps_id] = []
             return {
                 "action": override.get("mode") if override else self._mode,
                 "reason": override.get("reason") if override else self._reason,
                 "issued_at": override.get("issued_at") if override else self._last_transition,
                 "scope": "agent" if override else "global",
+                "actions": actions,
             }
 
     async def set_mode(
@@ -207,6 +289,7 @@ class CoordinatorState:
             "total_value": Decimal("0"),
             "has_position_value": False,
             "has_total_value": False,
+            "alerts": {"warning": 0, "critical": 0},
         }
         agents_snapshot = []
         for agent in self._agents.values():
@@ -230,6 +313,10 @@ class CoordinatorState:
             if agent.total_value is not None:
                 totals["total_value"] += agent.total_value
                 totals["has_total_value"] = True
+            for alert in payload.get("alerts", []):
+                severity = str(alert.get("severity", "")).lower()
+                if severity in totals["alerts"]:
+                    totals["alerts"][severity] += 1
 
         return {
             "mode": self._mode,
@@ -242,6 +329,7 @@ class CoordinatorState:
                 "trading_volume": str(totals["trading_volume"]),
                 "balance": str(totals["balance"]),
                 "total_value": str(totals["total_value"]) if totals["has_total_value"] else None,
+                "alerts": totals["alerts"],
             },
         }
 
@@ -267,8 +355,10 @@ class CoordinatorApp:
                 web.post("/metrics", self.handle_metrics),
                 web.get("/command", self.handle_command),
                 web.get("/status", self.handle_status),
+                web.post("/alerts", self.handle_alert),
                 web.post("/manual_pause", self.handle_manual_pause),
                 web.post("/manual_resume", self.handle_manual_resume),
+                web.post("/manual_balance", self.handle_manual_balance),
                 web.get("/dashboard", self.handle_dashboard),
             ]
         )
@@ -333,6 +423,42 @@ class CoordinatorApp:
         snapshot = await self.state.status()
         return web.json_response(snapshot)
 
+    async def handle_alert(self, request: web.Request) -> web.Response:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise web.HTTPBadRequest(text="JSON object required")
+        vps_id = payload.get("vps_id")
+        if not vps_id or not isinstance(vps_id, str):
+            raise web.HTTPBadRequest(text="vps_id required")
+        alert_type = payload.get("type")
+        if alert_type is None or not isinstance(alert_type, str) or not alert_type.strip():
+            alert_type = "general"
+        severity = payload.get("severity")
+        if severity is None or not isinstance(severity, str) or not severity.strip():
+            severity = "info"
+        message = payload.get("message") if isinstance(payload.get("message"), str) else None
+        timestamp_raw = payload.get("timestamp")
+        try:
+            timestamp = float(timestamp_raw) if timestamp_raw is not None else time.time()
+        except (TypeError, ValueError):
+            timestamp = time.time()
+        detail_keys = [
+            "position",
+            "active_closing_amount",
+            "difference",
+            "symbol",
+        ]
+        details: Dict[str, Any] = {key: payload.get(key) for key in detail_keys}
+        status = await self.state.set_alert(
+            vps_id=vps_id,
+            alert_type=alert_type,
+            severity=severity,
+            message=message,
+            details=details,
+            timestamp=timestamp,
+        )
+        return web.json_response(status)
+
     async def handle_manual_pause(self, request: web.Request) -> web.Response:
         self._require_dashboard_auth(request)
         payload: Dict[str, Any]
@@ -359,6 +485,24 @@ class CoordinatorApp:
         default_reason = "Manual resume (selected)" if targets else "Manual resume triggered"
         reason_text = reason if isinstance(reason, str) and reason.strip() else default_reason
         status = await self.state.set_mode(mode="RUN", reason=reason_text, target_vps_ids=targets)
+        return web.json_response(status)
+
+    async def handle_manual_balance(self, request: web.Request) -> web.Response:
+        self._require_dashboard_auth(request)
+        payload: Dict[str, Any]
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        reason = payload.get("reason") if isinstance(payload, dict) else None
+        targets = self._extract_target_vps(payload)
+        default_reason = "Manual balance (selected)" if targets else "Manual balance triggered"
+        reason_text = reason if isinstance(reason, str) and reason.strip() else default_reason
+        status = await self.state.enqueue_action(
+            action_type="MANUAL_BALANCE",
+            reason=reason_text,
+            target_vps_ids=targets,
+        )
         return web.json_response(status)
 
     async def handle_dashboard(self, request: web.Request) -> web.Response:

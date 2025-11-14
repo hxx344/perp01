@@ -50,6 +50,11 @@
       color: #022c22;
       box-shadow: 0 10px 24px rgba(16, 185, 129, 0.35);
     }
+    #balanceBtn {
+      background: linear-gradient(135deg, #fbbf24, #f97316);
+      color: #2c0a02;
+      box-shadow: 0 10px 24px rgba(251, 191, 36, 0.35);
+    }
     #refreshBtn {
       background: rgba(148, 163, 184, 0.2);
       color: #e2e8f0;
@@ -187,6 +192,24 @@
       background: rgba(248, 113, 113, 0.16);
       color: #fca5a5;
     }
+    .alert-pill {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 0.25rem 0.55rem;
+      font-size: 0.72rem;
+      font-weight: 600;
+      margin: 0.1rem 0.15rem 0.1rem 0;
+      white-space: nowrap;
+    }
+    .alert-warning {
+      background: rgba(250, 204, 21, 0.18);
+      color: #facc15;
+    }
+    .alert-critical {
+      background: rgba(248, 113, 113, 0.22);
+      color: #f87171;
+    }
     footer {
       margin-top: 2rem;
       font-size: 0.75rem;
@@ -214,6 +237,7 @@
     </div>
     <button id="pauseBtn">暂停选中/全部</button>
     <button id="resumeBtn">恢复选中/全部</button>
+    <button id="balanceBtn">手动平衡</button>
     <button id="refreshBtn">手动刷新</button>
   </div>
 
@@ -236,6 +260,11 @@
       <div class="value" id="total-volume">-</div>
     </div>
     <div class="card">
+      <h2>告警统计</h2>
+      <div class="value" id="alert-summary">正常</div>
+      <div class="reason" id="alert-details"></div>
+    </div>
+    <div class="card">
       <h2>余额合计</h2>
       <div class="value" id="total-balance">-</div>
       <div class="reason" id="total-value"></div>
@@ -254,11 +283,12 @@
         <th>成交量</th>
         <th>余额</th>
         <th>总资产</th>
+        <th>告警</th>
         <th>上报时间</th>
       </tr>
     </thead>
     <tbody id="agentTable">
-      <tr><td colspan="10" style="text-align:center;padding:1.5rem;color:#94a3b8;">暂无数据</td></tr>
+      <tr><td colspan="11" style="text-align:center;padding:1.5rem;color:#94a3b8;">暂无数据</td></tr>
     </tbody>
   </table>
 
@@ -272,8 +302,11 @@
     const totalVolumeEl = document.getElementById('total-volume');
     const totalBalanceEl = document.getElementById('total-balance');
     const totalValueEl = document.getElementById('total-value');
+  const alertSummaryEl = document.getElementById('alert-summary');
+  const alertDetailsEl = document.getElementById('alert-details');
     const tableBody = document.getElementById('agentTable');
     const targetSelect = document.getElementById('targetSelect');
+  const balanceBtn = document.getElementById('balanceBtn');
 
     function escapeHtml(value) {
       return String(value).replace(/[&<>'"]/g, ch => ({
@@ -310,6 +343,28 @@
         }
       }
       return parts.join('');
+    }
+
+    function formatAlerts(agent) {
+      const alerts = Array.isArray(agent && agent.alerts) ? agent.alerts : [];
+      if (!alerts.length) {
+        return '<span class="muted">-</span>';
+      }
+      return alerts.map(alert => {
+        const severity = (alert && alert.severity ? String(alert.severity) : '').toLowerCase();
+        const pillClass = severity === 'critical' ? 'alert-critical' : 'alert-warning';
+        const label = severity === 'critical' ? '严重' : '警告';
+        const message = alert && alert.message ? escapeHtml(alert.message) : '';
+        const timestamp = alert && alert.timestamp ? new Date(Number(alert.timestamp) * 1000).toLocaleString() : '';
+        const detailParts = [label];
+        if (message) {
+          detailParts.push(message);
+        }
+        if (timestamp) {
+          detailParts.push(timestamp);
+        }
+        return `<span class="alert-pill ${pillClass}">${detailParts.join(' · ')}</span>`;
+      }).join('<br>');
     }
 
     function updateTargetSelector(agents) {
@@ -384,12 +439,33 @@
       totalVolumeEl.textContent = totals.trading_volume ?? '-';
       totalBalanceEl.textContent = totals.balance ?? '-';
       totalValueEl.textContent = totals.total_value ? `总资产 ${totals.total_value}` : '';
+      if (alertSummaryEl) {
+        const alertTotals = totals.alerts || {};
+        const criticalCount = Number(alertTotals.critical || 0);
+        const warningCount = Number(alertTotals.warning || 0);
+        if ((criticalCount + warningCount) === 0) {
+          alertSummaryEl.textContent = '正常';
+          if (alertDetailsEl) {
+            alertDetailsEl.textContent = '';
+            alertDetailsEl.style.display = 'none';
+          }
+        } else {
+          const summaryParts = [];
+          if (criticalCount) summaryParts.push(`严重 ${criticalCount}`);
+          if (warningCount) summaryParts.push(`警告 ${warningCount}`);
+          alertSummaryEl.textContent = summaryParts.join(' / ');
+          if (alertDetailsEl) {
+            alertDetailsEl.textContent = '存在需要关注的节点，请检查下方告警列表。';
+            alertDetailsEl.style.display = '';
+          }
+        }
+      }
 
       const agents = Array.isArray(data.agents) ? data.agents : [];
       updateTargetSelector(agents);
 
       if (agents.length === 0) {
-        tableBody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:1.5rem;color:#94a3b8;">等待节点注册…</td></tr>';
+        tableBody.innerHTML = '<tr><td colspan="11" style="text-align:center;padding:1.5rem;color:#94a3b8;">等待节点注册…</td></tr>';
         return;
       }
 
@@ -406,6 +482,7 @@
             <td>${safeText(agent.trading_volume)}</td>
             <td>${safeText(agent.balance)}</td>
             <td>${safeText(agent.total_value)}</td>
+            <td>${formatAlerts(agent)}</td>
             <td>${safeText(tsString)}</td>
           </tr>
         `;
@@ -440,6 +517,22 @@
       renderStatus(data);
     }
 
+    async function postManualBalance(reason) {
+      const body = buildActionPayload(reason);
+      const res = await fetch('/manual_balance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || '手动平衡操作失败');
+      }
+      const data = await res.json();
+      renderStatus(data);
+    }
+
     document.getElementById('pauseBtn').addEventListener('click', async () => {
       const reason = prompt('暂停原因（可空）');
       try {
@@ -457,6 +550,17 @@
         alert(err.message);
       }
     });
+
+    if (balanceBtn) {
+      balanceBtn.addEventListener('click', async () => {
+        const reason = prompt('手动平衡说明（可空）');
+        try {
+          await postManualBalance(reason);
+        } catch (err) {
+          alert(err.message);
+        }
+      });
+    }
 
     document.getElementById('refreshBtn').addEventListener('click', () => {
       fetchStatus();
