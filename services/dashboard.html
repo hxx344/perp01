@@ -40,6 +40,157 @@
     button:hover {
       transform: translateY(-1px);
     }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: rgba(15, 23, 42, 0.72);
+      backdrop-filter: blur(6px);
+      z-index: 1000;
+      padding: 1.5rem;
+    }
+    .modal-backdrop.active {
+      display: flex;
+    }
+    .modal {
+      background: rgba(15, 23, 42, 0.95);
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 18px;
+      padding: clamp(1rem, 4vw, 2rem);
+      width: min(960px, 100%);
+      max-height: 90vh;
+      overflow-y: auto;
+      box-shadow: 0 28px 80px rgba(2, 6, 23, 0.65);
+    }
+    .modal h3 {
+      margin: 0;
+      font-size: clamp(1.2rem, 3vw, 1.6rem);
+    }
+    .modal p {
+      line-height: 1.5;
+    }
+    .modal textarea {
+      width: 100%;
+      min-height: 80px;
+      margin-top: 0.75rem;
+      padding: 0.7rem 0.9rem;
+      resize: vertical;
+      border-radius: 12px;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+      background: rgba(15, 23, 42, 0.6);
+      color: #e2e8f0;
+      font-size: 0.9rem;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .modal textarea:focus {
+      outline: none;
+      border-color: rgba(96, 165, 250, 0.7);
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.25);
+    }
+    .modal-actions {
+      display: flex;
+      gap: 0.75rem;
+      justify-content: flex-end;
+      margin-top: 1.25rem;
+      flex-wrap: wrap;
+    }
+    .modal button.primary {
+      background: linear-gradient(135deg, #34d399, #10b981);
+      color: #022c22;
+      box-shadow: 0 10px 24px rgba(16, 185, 129, 0.35);
+    }
+    .modal button.secondary {
+      background: rgba(148, 163, 184, 0.25);
+      color: #e2e8f0;
+      border: 1px solid rgba(148, 163, 184, 0.35);
+    }
+    .preview-wrapper {
+      margin-top: 1rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+    .preview-card {
+      background: rgba(15, 23, 42, 0.75);
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 16px;
+      padding: 1rem 1.2rem;
+    }
+    .preview-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      margin-bottom: 0.65rem;
+    }
+    .preview-header h4 {
+      margin: 0;
+      font-size: 1rem;
+    }
+    .preview-stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 0.55rem;
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .preview-stats li {
+      background: rgba(148, 163, 184, 0.12);
+      border-radius: 12px;
+      padding: 0.55rem 0.7rem;
+      font-size: 0.85rem;
+      color: #e2e8f0;
+    }
+    .preview-stats li span {
+      display: block;
+      margin-top: 0.2rem;
+      font-weight: 600;
+      color: #facc15;
+    }
+    .preview-stats li.danger {
+      background: rgba(248, 113, 113, 0.18);
+      color: #fecaca;
+    }
+    .preview-stats li.danger span {
+      color: #f87171;
+    }
+    .preview-orders {
+      margin-top: 0.75rem;
+    }
+    .order-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 0.45rem;
+      font-size: 0.83rem;
+      border: 1px solid rgba(148, 163, 184, 0.25);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .order-table th,
+    .order-table td {
+      padding: 0.55rem 0.7rem;
+      text-align: left;
+    }
+    .order-table th {
+      background: rgba(30, 41, 59, 0.85);
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .order-table tbody tr:nth-child(odd) {
+      background: rgba(148, 163, 184, 0.08);
+    }
+    .order-table tbody tr:nth-child(even) {
+      background: rgba(148, 163, 184, 0.04);
+    }
+    .modal-note {
+      margin-top: 0.35rem;
+      font-size: 0.8rem;
+      color: rgba(148, 163, 184, 0.7);
+    }
     #pauseBtn {
       background: linear-gradient(135deg, #f97316, #fb7185);
       color: #0f172a;
@@ -294,6 +445,20 @@
 
   <footer>此页面每 5 秒刷新一次，暂停/恢复操作需要 Basic Auth（若启用）。</footer>
 
+  <div id="balanceModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="balanceModalTitle">
+    <div class="modal">
+      <h3 id="balanceModalTitle">手动平衡预览</h3>
+      <p class="modal-note" id="balanceModalSummary">加载手动平衡数据中…</p>
+      <div id="balanceModalContent" class="preview-wrapper"></div>
+      <label for="balanceReason" class="modal-note">平衡原因（可选）</label>
+      <textarea id="balanceReason" placeholder="例如：人工核对仓位后，需统一发起平衡"></textarea>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="balanceCancelBtn">取消</button>
+        <button type="button" class="primary" id="balanceConfirmBtn">确认执行</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const modeEl = document.getElementById('mode');
     const reasonEl = document.getElementById('reason');
@@ -302,11 +467,20 @@
     const totalVolumeEl = document.getElementById('total-volume');
     const totalBalanceEl = document.getElementById('total-balance');
     const totalValueEl = document.getElementById('total-value');
-  const alertSummaryEl = document.getElementById('alert-summary');
-  const alertDetailsEl = document.getElementById('alert-details');
+    const alertSummaryEl = document.getElementById('alert-summary');
+    const alertDetailsEl = document.getElementById('alert-details');
     const tableBody = document.getElementById('agentTable');
     const targetSelect = document.getElementById('targetSelect');
-  const balanceBtn = document.getElementById('balanceBtn');
+    const balanceBtn = document.getElementById('balanceBtn');
+    const balanceModal = document.getElementById('balanceModal');
+    const balanceModalContent = document.getElementById('balanceModalContent');
+    const balanceModalSummary = document.getElementById('balanceModalSummary');
+    const balanceReasonInput = document.getElementById('balanceReason');
+    const balanceConfirmBtn = document.getElementById('balanceConfirmBtn');
+    const balanceCancelBtn = document.getElementById('balanceCancelBtn');
+
+    let latestStatus = null;
+    let pendingBalanceTargets = [];
 
     function escapeHtml(value) {
       return String(value).replace(/[&<>'"]/g, ch => ({
@@ -323,6 +497,28 @@
         return '-';
       }
       return escapeHtml(value);
+    }
+
+    function formatTimestamp(seconds) {
+      const num = Number(seconds);
+      if (Number.isNaN(num) || num <= 0) {
+        return '-';
+      }
+      return new Date(num * 1000).toLocaleString();
+    }
+
+    function formatSideLabel(side) {
+      if (!side) {
+        return '-';
+      }
+      const normalized = String(side).toLowerCase();
+      if (normalized === 'buy') {
+        return '买入 (BUY)';
+      }
+      if (normalized === 'sell') {
+        return '卖出 (SELL)';
+      }
+      return normalized.toUpperCase();
     }
 
     function formatCommand(agent) {
@@ -367,6 +563,205 @@
       }).join('<br>');
     }
 
+    function resolveTargetsFromStatus(status) {
+      if (!status || !Array.isArray(status.agents)) {
+        return [];
+      }
+      const allAgents = status.agents.filter(agent => agent && agent.vps_id).map(agent => agent.vps_id);
+      if (!targetSelect || targetSelect.disabled || targetSelect.value === '__all__') {
+        return allAgents;
+      }
+      if (targetSelect.value && allAgents.includes(targetSelect.value)) {
+        return [targetSelect.value];
+      }
+      return [];
+    }
+
+    function buildPreviewCard(agent) {
+      if (!agent) {
+        return '';
+      }
+      const displayName = agent.display_name ? `${agent.display_name} (${agent.vps_id})` : agent.vps_id;
+      const preview = agent.manual_balance_preview && typeof agent.manual_balance_preview === 'object'
+        ? agent.manual_balance_preview
+        : null;
+      const severity = preview && preview.severity ? String(preview.severity).toLowerCase() : null;
+      let severityBadge = '';
+      if (severity === 'critical') {
+        severityBadge = '<span class="alert-pill alert-critical">严重</span>';
+      } else if (severity === 'warning') {
+        severityBadge = '<span class="alert-pill alert-warning">警告</span>';
+      }
+
+      let statsHtml = '<p class="muted">暂无平衡数据，请稍后重试。</p>';
+      let ordersHtml = '';
+
+      if (preview) {
+        const diffValue = Number(preview.difference);
+        const stats = [
+          {
+            label: '当前仓位',
+            value: preview.position,
+            danger: false,
+          },
+          {
+            label: '平仓挂单总量',
+            value: preview.active_close_amount,
+            danger: false,
+          },
+          {
+            label: '仓位差值',
+            value: preview.difference,
+            danger: !Number.isNaN(diffValue) && diffValue > 0,
+          },
+          {
+            label: '建议平仓方向',
+            value: formatSideLabel(preview.close_side || ''),
+            danger: false,
+          },
+          {
+            label: '平仓订单数量',
+            value: preview.order_count,
+            danger: false,
+          },
+          {
+            label: '数据刷新时间',
+            value: formatTimestamp(preview.timestamp),
+            danger: false,
+          },
+        ];
+
+        statsHtml = `
+          <ul class="preview-stats">
+            ${stats.map(item => `
+              <li class="${item.danger ? 'danger' : ''}">
+                ${escapeHtml(item.label)}
+                <span>${safeText(item.value)}</span>
+              </li>
+            `).join('')}
+          </ul>
+        `;
+
+        const orders = Array.isArray(preview.orders) ? preview.orders : [];
+        if (orders.length) {
+          const rows = orders.map((order, idx) => {
+            const fallbackId = order && order.id ? order.id : `#${idx + 1}`;
+            return `
+              <tr>
+                <td>${safeText(fallbackId)}</td>
+                <td>${safeText(order && order.side)}</td>
+                <td>${safeText(order && order.size)}</td>
+                <td>${safeText(order && order.price)}</td>
+              </tr>
+            `;
+          }).join('');
+          ordersHtml = `
+            <div class="preview-orders">
+              <div class="muted">以下为当前正在平仓的委托单：</div>
+              <table class="order-table">
+                <thead>
+                  <tr>
+                    <th>订单编号</th>
+                    <th>方向</th>
+                    <th>数量</th>
+                    <th>价格</th>
+                  </tr>
+                </thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+          `;
+        } else {
+          ordersHtml = '<p class="muted">暂无正在执行的平仓委托单。</p>';
+        }
+      }
+
+      return `
+        <div class="preview-card">
+          <div class="preview-header">
+            <h4>${escapeHtml(displayName || agent.vps_id || '未知节点')}</h4>
+            ${severityBadge}
+          </div>
+          ${statsHtml}
+          ${ordersHtml}
+        </div>
+      `;
+    }
+
+    function openBalanceModal(summaryText, cardsHtml) {
+      if (!balanceModal) {
+        return;
+      }
+      if (balanceModalSummary) {
+        balanceModalSummary.textContent = summaryText;
+      }
+      if (balanceModalContent) {
+        balanceModalContent.innerHTML = cardsHtml;
+      }
+      if (balanceReasonInput) {
+        balanceReasonInput.value = '';
+      }
+      if (balanceConfirmBtn) {
+        balanceConfirmBtn.disabled = false;
+        balanceConfirmBtn.textContent = '确认执行';
+      }
+      balanceModal.classList.add('active');
+      setTimeout(() => {
+        if (balanceReasonInput) {
+          balanceReasonInput.focus();
+        }
+      }, 50);
+    }
+
+    function closeBalanceModal() {
+      if (!balanceModal) {
+        return;
+      }
+      balanceModal.classList.remove('active');
+      if (balanceReasonInput) {
+        balanceReasonInput.value = '';
+      }
+      pendingBalanceTargets = [];
+      if (balanceConfirmBtn) {
+        balanceConfirmBtn.disabled = false;
+        balanceConfirmBtn.textContent = '确认执行';
+      }
+    }
+
+    async function showBalancePreview() {
+      try {
+        const snapshot = await fetchStatusSnapshot();
+        renderStatus(snapshot);
+        const targets = resolveTargetsFromStatus(snapshot);
+        if (!targets.length) {
+          alert('当前没有可执行手动平衡的节点。');
+          return;
+        }
+        const agentMap = new Map();
+        snapshot.agents.forEach(agent => {
+          if (agent && agent.vps_id) {
+            agentMap.set(agent.vps_id, agent);
+          }
+        });
+        const selectedAgents = targets
+          .map(id => agentMap.get(id))
+          .filter(agent => !!agent);
+        if (!selectedAgents.length) {
+          alert('未找到选中的节点详情，请稍后再试。');
+          return;
+        }
+  pendingBalanceTargets = Array.from(new Set(targets));
+        const cardsHtml = selectedAgents.map(buildPreviewCard).join('');
+        const summaryText = targets.length === snapshot.agents.length
+          ? `将对所有 ${targets.length} 个节点发起手动平衡指令。`
+          : `将对 ${targets.length} 个选中节点发起手动平衡。`;
+        openBalanceModal(summaryText, cardsHtml || '<p class="muted">暂无可展示的平衡数据。</p>');
+      } catch (err) {
+        console.error(err);
+        alert(err.message || '获取手动平衡预览失败');
+      }
+    }
+
     function updateTargetSelector(agents) {
       if (!targetSelect) {
         return;
@@ -407,13 +802,17 @@
       targetSelect.disabled = optionValues.length <= 1;
     }
 
+    async function fetchStatusSnapshot() {
+      const res = await fetch('/status', { credentials: 'include' });
+      if (!res.ok) {
+        throw new Error('状态请求失败');
+      }
+      return res.json();
+    }
+
     async function fetchStatus() {
       try {
-        const res = await fetch('/status', { credentials: 'include' });
-        if (!res.ok) {
-          throw new Error('状态请求失败');
-        }
-        const data = await res.json();
+        const data = await fetchStatusSnapshot();
         renderStatus(data);
       } catch (err) {
         console.error(err);
@@ -421,6 +820,7 @@
     }
 
     function renderStatus(data) {
+      latestStatus = data;
       const isPaused = data.mode === 'PAUSE';
       modeEl.textContent = data.mode === 'RUN' ? '运行中' : '已暂停';
       modeEl.className = 'badge ' + (isPaused ? 'badge-pause' : 'badge-run');
@@ -490,12 +890,23 @@
       tableBody.innerHTML = rows.join('');
     }
 
-    function buildActionPayload(reason) {
+    function buildActionPayload(reason, explicitTargets) {
       const payload = {};
       if (typeof reason === 'string' && reason.trim()) {
         payload.reason = reason.trim();
       }
-      if (targetSelect && !targetSelect.disabled && targetSelect.value && targetSelect.value !== '__all__') {
+      const targets = Array.isArray(explicitTargets)
+        ? Array.from(new Set(
+            explicitTargets
+              .filter(target => typeof target === 'string' && target.trim())
+              .map(target => target.trim())
+          ))
+        : [];
+      if (targets.length === 1) {
+        payload.vps_id = targets[0];
+      } else if (targets.length > 1) {
+        payload.vps_ids = targets;
+      } else if (targetSelect && !targetSelect.disabled && targetSelect.value && targetSelect.value !== '__all__') {
         payload.vps_id = targetSelect.value;
       }
       return payload;
@@ -517,8 +928,8 @@
       renderStatus(data);
     }
 
-    async function postManualBalance(reason) {
-      const body = buildActionPayload(reason);
+    async function postManualBalance(reason, targets) {
+      const body = buildActionPayload(reason, targets);
       const res = await fetch('/manual_balance', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -552,12 +963,37 @@
     });
 
     if (balanceBtn) {
-      balanceBtn.addEventListener('click', async () => {
-        const reason = prompt('手动平衡说明（可空）');
+      balanceBtn.addEventListener('click', showBalancePreview);
+    }
+
+    if (balanceCancelBtn) {
+      balanceCancelBtn.addEventListener('click', closeBalanceModal);
+    }
+
+    if (balanceModal) {
+      balanceModal.addEventListener('click', event => {
+        if (event.target === balanceModal) {
+          closeBalanceModal();
+        }
+      });
+    }
+
+    if (balanceConfirmBtn) {
+      balanceConfirmBtn.addEventListener('click', async () => {
+        if (!pendingBalanceTargets.length) {
+          closeBalanceModal();
+          return;
+        }
+        const reason = balanceReasonInput.value;
+        balanceConfirmBtn.disabled = true;
+        balanceConfirmBtn.textContent = '执行中…';
         try {
-          await postManualBalance(reason);
+          await postManualBalance(reason, pendingBalanceTargets);
+          closeBalanceModal();
         } catch (err) {
-          alert(err.message);
+          alert(err.message || '手动平衡执行失败');
+          balanceConfirmBtn.disabled = false;
+          balanceConfirmBtn.textContent = '确认执行';
         }
       });
     }

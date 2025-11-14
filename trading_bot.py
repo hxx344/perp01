@@ -10,7 +10,7 @@ import inspect
 from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
-from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING, Literal, cast
+from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING, Literal, Iterable, cast
 
 from exchanges import ExchangeFactory
 from helpers import TradingLogger
@@ -231,34 +231,95 @@ class TradingBot:
             return
         self._coordinator_trade_volume += qty * px
 
-    def _closing_side_for_position(self, position_amt: Optional[Decimal]) -> str:
+    def _closing_side_for_position(
+        self,
+        position_amt: Optional[Decimal] = None,
+        orders: Optional[Iterable[Any]] = None,
+    ) -> str:
+        default_side = self.config.close_order_side
+
+        best_side: Optional[str] = None
+        best_total = Decimal("0")
+
+        if orders is not None:
+            totals: Dict[str, Decimal] = {}
+
+            for order in orders:
+                side_raw = getattr(order, "side", None)
+                if side_raw is None and isinstance(order, dict):
+                    side_raw = order.get("side")
+
+                side = str(side_raw).lower() if side_raw else None
+                if side not in {"buy", "sell"}:
+                    continue
+
+                size_raw: Any = getattr(order, "size", None)
+                if size_raw is None and isinstance(order, dict):
+                    size_raw = order.get("size")
+
+                size_decimal = self._safe_decimal_or_none(size_raw)
+                if size_decimal is None or size_decimal <= 0:
+                    continue
+
+                totals[side] = totals.get(side, Decimal("0")) + size_decimal
+                if totals[side] > best_total:
+                    best_total = totals[side]
+                    best_side = side
+
+        if best_side:
+            return best_side
+
         if position_amt is not None:
             if position_amt > 0:
                 return "sell"
             if position_amt < 0:
                 return "buy"
-        return self.config.close_order_side
+
+        return default_side
 
     def _prepare_close_orders(
         self,
         orders: List[Any],
         position_amt: Optional[Decimal] = None,
-    ) -> Tuple[List[Dict[str, Any]], Decimal]:
-        close_side = self._closing_side_for_position(position_amt)
+    ) -> Tuple[List[Dict[str, Any]], Decimal, Optional[str]]:
+        close_side = self._closing_side_for_position(position_amt=position_amt, orders=orders)
         close_orders: List[Dict[str, Any]] = []
         total = Decimal("0")
+
         for order in orders:
-            if close_side and order.side != close_side:
+            side_raw = getattr(order, "side", None)
+            if side_raw is None and isinstance(order, dict):
+                side_raw = order.get("side")
+            side = str(side_raw).lower() if side_raw else None
+
+            if close_side and side and side != close_side:
                 continue
-            size_decimal = self._safe_decimal(order.size)
+
+            size_raw = getattr(order, "size", None)
+            if size_raw is None and isinstance(order, dict):
+                size_raw = order.get("size")
+
+            size_decimal = self._safe_decimal_or_none(size_raw)
+            if size_decimal is None or size_decimal <= 0:
+                continue
+
+            price = getattr(order, "price", None)
+            if price is None and isinstance(order, dict):
+                price = order.get("price")
+
+            order_id = getattr(order, "order_id", None)
+            if order_id is None and isinstance(order, dict):
+                order_id = order.get("id") or order.get("order_id")
+
             close_orders.append({
-                "id": order.order_id,
-                "price": order.price,
+                "id": order_id,
+                "price": price,
                 "size": size_decimal,
-                "side": order.side,
+                "side": side or close_side,
             })
             total += size_decimal
-        return close_orders, total
+
+        return close_orders, total, close_side
 
     def _classify_mismatch_severity(self, mismatch_amount: Decimal) -> Optional[str]:
         warning_threshold = self.config.quantity * Decimal("2")
@@ -359,7 +420,7 @@ class TradingBot:
             try:
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                 position_amt = await self.exchange_client.get_account_positions()
-                self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
                     active_orders,
                     position_amt,
                 )
@@ -369,7 +430,7 @@ class TradingBot:
                     await asyncio.sleep(3)
                     refreshed_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                     position_amt = await self.exchange_client.get_account_positions()
-                    self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                    self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
                         refreshed_orders,
                         position_amt,
                     )
@@ -517,6 +578,7 @@ class TradingBot:
 
         position_symbol: Optional[str] = None
         position_value: Optional[Decimal] = None
+        manual_preview: Optional[Dict[str, Any]] = None
         position_snapshot_method = getattr(self.exchange_client, "get_position_snapshot", None)
         if callable(position_snapshot_method):
             try:
@@ -540,6 +602,44 @@ class TradingBot:
                         position_value = value_decimal
             except Exception as exc:
                 self.logger.log(f"获取仓位详情失败: {exc}", "WARNING")
+
+        try:
+            raw_active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
+            if isinstance(raw_active_orders, list):
+                active_orders: List[Any] = list(raw_active_orders)
+            elif raw_active_orders is None:
+                active_orders = []
+            else:
+                active_orders = list(raw_active_orders)
+        except Exception as exc:
+            self.logger.log(f"获取委托单失败（预览将为空）: {exc}", "WARNING")
+            active_orders = []
+
+        try:
+            close_orders, close_total, close_side = self._prepare_close_orders(active_orders, position)
+            mismatch_amount = abs(abs(position) - close_total)
+            severity = self._classify_mismatch_severity(mismatch_amount)
+            preview_orders: List[Dict[str, Any]] = []
+            for order in close_orders:
+                preview_orders.append({
+                    "id": order.get("id"),
+                    "side": order.get("side"),
+                    "size": str(order.get("size")) if order.get("size") is not None else None,
+                    "price": str(order.get("price")) if order.get("price") is not None else None,
+                })
+            manual_preview = {
+                "position": str(position),
+                "position_abs": str(abs(position)),
+                "active_close_amount": str(close_total),
+                "difference": str(mismatch_amount),
+                "close_side": close_side,
+                "order_count": len(preview_orders),
+                "orders": preview_orders,
+                "severity": severity,
+                "timestamp": time.time(),
+            }
+        except Exception as exc:
+            self.logger.log(f"生成手动平衡预览失败: {exc}", "WARNING")
 
         balance = Decimal("0")
         total_value: Optional[Decimal] = None
@@ -591,6 +691,8 @@ class TradingBot:
             payload["position_symbol"] = position_symbol
         if position_value is not None:
             payload["position_value"] = str(position_value)
+        if manual_preview is not None:
+            payload["manual_balance_preview"] = manual_preview
         return payload
 
     async def _push_coordinator_metrics(self) -> None:
@@ -836,7 +938,7 @@ class TradingBot:
                 position_amt = await self.exchange_client.get_account_positions()
 
                 # Filter close orders based on actual position direction
-                self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
                     active_orders,
                     position_amt,
                 )
@@ -856,7 +958,7 @@ class TradingBot:
                         # Refresh orders and positions after balancing attempt
                         active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                         position_amt = await self.exchange_client.get_account_positions()
-                        self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                        self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
                             active_orders,
                             position_amt,
                         )
@@ -1100,7 +1202,7 @@ class TradingBot:
                     snapshot_position = await self.exchange_client.get_account_positions()
                 except Exception:
                     snapshot_position = None
-                self.active_close_orders, _ = self._prepare_close_orders(
+                self.active_close_orders, _, _ = self._prepare_close_orders(
                     active_orders,
                     snapshot_position,
                 )

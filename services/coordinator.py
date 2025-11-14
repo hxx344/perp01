@@ -60,6 +60,7 @@ class VPSState:
     total_value: Optional[Decimal] = None
     last_report_ts: float = field(default_factory=lambda: 0.0)
     alerts: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    manual_balance_preview: Optional[Dict[str, Any]] = None
 
     def as_payload(self) -> Dict[str, Any]:
         return {
@@ -73,6 +74,7 @@ class VPSState:
             "total_value": str(self.total_value) if self.total_value is not None else None,
             "last_report_ts": self.last_report_ts,
             "alerts": [dict(alert) for alert in self.alerts.values()],
+            "manual_balance_preview": self.manual_balance_preview,
         }
 
 
@@ -119,6 +121,7 @@ class CoordinatorState:
         balance: Decimal,
         total_value: Optional[Decimal],
         timestamp: float,
+        manual_balance_preview: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         async with self._lock:
             if vps_id not in self._agents:
@@ -131,6 +134,9 @@ class CoordinatorState:
             state.balance = balance
             state.total_value = total_value
             state.last_report_ts = timestamp
+            state.manual_balance_preview = (
+                manual_balance_preview if isinstance(manual_balance_preview, dict) else None
+            )
             LOGGER.debug(
                 "Metrics update %s pos=%s vol=%s balance=%s",
                 vps_id,
@@ -399,6 +405,9 @@ class CoordinatorApp:
         position_value_raw = payload.get("position_value")
         position_value = _to_decimal(position_value_raw) if position_value_raw is not None else None
         timestamp = float(payload.get("timestamp", time.time()))
+        preview_payload = payload.get("manual_balance_preview")
+        if not isinstance(preview_payload, dict):
+            preview_payload = None
 
         status = await self.state.update_metrics(
             vps_id=vps_id,
@@ -409,9 +418,9 @@ class CoordinatorApp:
             balance=balance,
             total_value=total_value,
             timestamp=timestamp,
+            manual_balance_preview=preview_payload,
         )
         return web.json_response(status)
-
     async def handle_command(self, request: web.Request) -> web.Response:
         vps_id = request.query.get("vps_id")
         if not vps_id:
