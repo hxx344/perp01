@@ -25,6 +25,7 @@
       flex-wrap: wrap;
       gap: 0.75rem;
       margin-bottom: 1.5rem;
+      align-items: center;
     }
     button {
       appearance: none;
@@ -53,6 +54,38 @@
       background: rgba(148, 163, 184, 0.2);
       color: #e2e8f0;
       border: 1px solid rgba(148, 163, 184, 0.4);
+    }
+    .target-wrapper {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+      min-width: 200px;
+    }
+    .target-wrapper span {
+      font-size: 0.72rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: rgba(148, 163, 184, 0.75);
+    }
+    .target-select {
+      appearance: none;
+      background: rgba(15, 23, 42, 0.6);
+      color: #e2e8f0;
+      border: 1px solid rgba(148, 163, 184, 0.4);
+      border-radius: 999px;
+      padding: 0.55rem 0.9rem;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    .target-select:focus {
+      outline: none;
+      border-color: rgba(96, 165, 250, 0.7);
+      box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.25);
+    }
+    .target-select:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
     }
     .grid {
       display: grid;
@@ -130,6 +163,30 @@
       background: rgba(248, 113, 113, 0.16);
       color: #fca5a5;
     }
+    .muted {
+      font-size: 0.78rem;
+      color: rgba(148, 163, 184, 0.75);
+      margin-top: 0.3rem;
+      display: block;
+      line-height: 1.3;
+    }
+    .command-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 0.2rem 0.7rem;
+      font-size: 0.78rem;
+      font-weight: 600;
+    }
+    .command-run {
+      background: rgba(45, 212, 191, 0.16);
+      color: #5eead4;
+    }
+    .command-pause {
+      background: rgba(248, 113, 113, 0.16);
+      color: #fca5a5;
+    }
     footer {
       margin-top: 2rem;
       font-size: 0.75rem;
@@ -149,8 +206,14 @@
 <body>
   <h1>轻量协调中心</h1>
   <div class="actions">
-    <button id="pauseBtn">全局暂停</button>
-    <button id="resumeBtn">恢复运行</button>
+    <div class="target-wrapper">
+      <span>作用节点</span>
+      <select id="targetSelect" class="target-select">
+        <option value="__all__">全部节点</option>
+      </select>
+    </div>
+    <button id="pauseBtn">暂停选中/全部</button>
+    <button id="resumeBtn">恢复选中/全部</button>
     <button id="refreshBtn">手动刷新</button>
   </div>
 
@@ -184,6 +247,7 @@
       <tr>
         <th>VPS</th>
         <th>别名</th>
+        <th>执行状态</th>
         <th>持仓</th>
         <th>品种</th>
         <th>持仓价值</th>
@@ -194,7 +258,7 @@
       </tr>
     </thead>
     <tbody id="agentTable">
-      <tr><td colspan="7" style="text-align:center;padding:1.5rem;color:#94a3b8;">暂无数据</td></tr>
+      <tr><td colspan="10" style="text-align:center;padding:1.5rem;color:#94a3b8;">暂无数据</td></tr>
     </tbody>
   </table>
 
@@ -209,6 +273,84 @@
     const totalBalanceEl = document.getElementById('total-balance');
     const totalValueEl = document.getElementById('total-value');
     const tableBody = document.getElementById('agentTable');
+    const targetSelect = document.getElementById('targetSelect');
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>'"]/g, ch => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        "'": '&#39;',
+        '"': '&quot;'
+      })[ch] || ch);
+    }
+
+    function safeText(value) {
+      if (value === undefined || value === null || value === '') {
+        return '-';
+      }
+      return escapeHtml(value);
+    }
+
+    function formatCommand(agent) {
+      const commandRaw = agent && agent.command ? String(agent.command).toUpperCase() : 'RUN';
+      const isPause = commandRaw === 'PAUSE';
+      const pillClass = isPause ? 'command-pause' : 'command-run';
+      const pillText = isPause ? '暂停' : '运行';
+      const scopeLabel = agent && agent.command_scope === 'agent' ? '单独' : '全局';
+      const parts = [`<span class="command-pill ${pillClass}">${pillText}</span>`];
+      parts.push(`<span class="muted">范围：${scopeLabel}</span>`);
+      if (agent && agent.command_reason) {
+        parts.push(`<span class="muted">${escapeHtml(agent.command_reason)}</span>`);
+      }
+      if (agent && agent.command_issued_at) {
+        const ts = Number(agent.command_issued_at);
+        if (!Number.isNaN(ts) && ts > 0) {
+          parts.push(`<span class="muted">指令时间：${escapeHtml(new Date(ts * 1000).toLocaleString())}</span>`);
+        }
+      }
+      return parts.join('');
+    }
+
+    function updateTargetSelector(agents) {
+      if (!targetSelect) {
+        return;
+      }
+      const previous = targetSelect.value || '__all__';
+      targetSelect.innerHTML = '';
+      const allOption = document.createElement('option');
+      allOption.value = '__all__';
+      allOption.textContent = '全部节点';
+      targetSelect.appendChild(allOption);
+      if (!Array.isArray(agents)) {
+        targetSelect.value = '__all__';
+        targetSelect.disabled = true;
+        return;
+      }
+      const seen = new Set();
+      agents.forEach(agent => {
+        if (!agent || typeof agent.vps_id !== 'string') {
+          return;
+        }
+        const vpsId = agent.vps_id;
+        if (seen.has(vpsId)) {
+          return;
+        }
+        seen.add(vpsId);
+        const option = document.createElement('option');
+        option.value = vpsId;
+        const displayName = agent.display_name ? String(agent.display_name).trim() : '';
+        option.textContent = displayName ? `${displayName} (${vpsId})` : vpsId;
+        targetSelect.appendChild(option);
+      });
+      const optionValues = Array.from(targetSelect.options).map(opt => opt.value);
+      if (optionValues.includes(previous)) {
+        targetSelect.value = previous;
+      } else {
+        targetSelect.value = '__all__';
+      }
+      targetSelect.disabled = optionValues.length <= 1;
+    }
 
     async function fetchStatus() {
       try {
@@ -238,38 +380,52 @@
 
       const totals = data.totals || {};
       totalPositionEl.textContent = totals.position ?? '-';
-       totalPositionValueEl.textContent = totals.position_value ?? '-';
+      totalPositionValueEl.textContent = totals.position_value ?? '-';
       totalVolumeEl.textContent = totals.trading_volume ?? '-';
       totalBalanceEl.textContent = totals.balance ?? '-';
       totalValueEl.textContent = totals.total_value ? `总资产 ${totals.total_value}` : '';
 
       const agents = Array.isArray(data.agents) ? data.agents : [];
+      updateTargetSelector(agents);
+
       if (agents.length === 0) {
-        tableBody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:1.5rem;color:#94a3b8;">等待节点注册…</td></tr>';
+        tableBody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:1.5rem;color:#94a3b8;">等待节点注册…</td></tr>';
         return;
       }
 
       const rows = agents.map(agent => {
-        const ts = agent.last_report_ts ? new Date(agent.last_report_ts * 1000).toLocaleString() : '-';
+        const tsString = agent.last_report_ts ? new Date(agent.last_report_ts * 1000).toLocaleString() : '-';
         return `
           <tr>
-            <td>${agent.vps_id}</td>
-            <td>${agent.display_name ?? '-'}</td>
-            <td>${agent.position ?? '-'}</td>
-            <td>${agent.position_symbol ?? '-'}</td>
-            <td>${agent.position_value ?? '-'}</td>
-            <td>${agent.trading_volume ?? '-'}</td>
-            <td>${agent.balance ?? '-'}</td>
-            <td>${agent.total_value ?? '-'}</td>
-            <td>${ts}</td>
+            <td>${safeText(agent.vps_id)}</td>
+            <td>${safeText(agent.display_name)}</td>
+            <td>${formatCommand(agent)}</td>
+            <td>${safeText(agent.position)}</td>
+            <td>${safeText(agent.position_symbol)}</td>
+            <td>${safeText(agent.position_value)}</td>
+            <td>${safeText(agent.trading_volume)}</td>
+            <td>${safeText(agent.balance)}</td>
+            <td>${safeText(agent.total_value)}</td>
+            <td>${safeText(tsString)}</td>
           </tr>
         `;
       });
       tableBody.innerHTML = rows.join('');
     }
 
+    function buildActionPayload(reason) {
+      const payload = {};
+      if (typeof reason === 'string' && reason.trim()) {
+        payload.reason = reason.trim();
+      }
+      if (targetSelect && !targetSelect.disabled && targetSelect.value && targetSelect.value !== '__all__') {
+        payload.vps_id = targetSelect.value;
+      }
+      return payload;
+    }
+
     async function postAction(url, reason) {
-      const body = reason ? { reason } : {};
+      const body = buildActionPayload(reason);
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

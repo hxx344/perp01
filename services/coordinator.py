@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, Iterable, List, Literal, Optional
 
 from aiohttp import web
 
@@ -83,6 +83,7 @@ class CoordinatorState:
         self._mode: Action = "RUN"
         self._reason: Optional[str] = None
         self._last_transition: float = time.time()
+        self._agent_overrides: Dict[str, Dict[str, Any]] = {}
 
     # ------------------------------------------------------------------
     # Registration & inspection helpers
@@ -140,21 +141,56 @@ class CoordinatorState:
         async with self._lock:
             if vps_id not in self._agents:
                 raise web.HTTPNotFound(text=f"vps '{vps_id}' is not registered")
+            override = self._agent_overrides.get(vps_id)
             return {
-                "action": self._mode,
-                "reason": self._reason,
-                "issued_at": self._last_transition,
+                "action": override.get("mode") if override else self._mode,
+                "reason": override.get("reason") if override else self._reason,
+                "issued_at": override.get("issued_at") if override else self._last_transition,
+                "scope": "agent" if override else "global",
             }
 
-    async def set_mode(self, *, mode: Action, reason: Optional[str]) -> Dict[str, Any]:
+    async def set_mode(
+        self,
+        *,
+        mode: Action,
+        reason: Optional[str],
+        target_vps_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
         async with self._lock:
-            if mode == self._mode:
-                # Idempotent – just echo current state
+            now = time.time()
+            if target_vps_ids is None:
+                if mode == self._mode and reason == self._reason:
+                    return self._status_locked()
+                self._mode = mode
+                self._reason = reason
+                self._last_transition = now
+                self._agent_overrides.clear()
+                LOGGER.warning("Global mode switched to %s: %s", mode, reason)
                 return self._status_locked()
-            self._mode = mode
-            self._reason = reason
-            self._last_transition = time.time()
-            LOGGER.warning("Global mode switched to %s: %s", mode, reason)
+
+            updated_targets = []
+            for vps_id in target_vps_ids:
+                if vps_id not in self._agents:
+                    LOGGER.warning("Attempted to set mode for unknown VPS %s", vps_id)
+                    continue
+                if mode == self._mode:
+                    if vps_id in self._agent_overrides:
+                        del self._agent_overrides[vps_id]
+                        updated_targets.append(vps_id)
+                else:
+                    self._agent_overrides[vps_id] = {
+                        "mode": mode,
+                        "reason": reason,
+                        "issued_at": now,
+                    }
+                    updated_targets.append(vps_id)
+
+            if updated_targets:
+                LOGGER.warning(
+                    "Override mode %s applied to: %s",
+                    mode,
+                    ", ".join(updated_targets),
+                )
             return self._status_locked()
 
     async def status(self) -> Dict[str, Any]:
@@ -174,7 +210,17 @@ class CoordinatorState:
         }
         agents_snapshot = []
         for agent in self._agents.values():
-            agents_snapshot.append(agent.as_payload())
+            payload = agent.as_payload()
+            override = self._agent_overrides.get(agent.vps_id)
+            payload.update(
+                {
+                    "command": override.get("mode") if override else self._mode,
+                    "command_reason": override.get("reason") if override else self._reason,
+                    "command_scope": "agent" if override else "global",
+                    "command_issued_at": override.get("issued_at") if override else self._last_transition,
+                }
+            )
+            agents_snapshot.append(payload)
             totals["position"] += agent.position
             if agent.position_value is not None:
                 totals["position_value"] += agent.position_value
@@ -295,8 +341,10 @@ class CoordinatorApp:
         except Exception:
             payload = {}
         reason = payload.get("reason") if isinstance(payload, dict) else None
-        reason_text = reason if isinstance(reason, str) and reason.strip() else "Manual pause triggered"
-        status = await self.state.set_mode(mode="PAUSE", reason=reason_text)
+        targets = self._extract_target_vps(payload)
+        default_reason = "Manual pause (selected)" if targets else "Manual pause triggered"
+        reason_text = reason if isinstance(reason, str) and reason.strip() else default_reason
+        status = await self.state.set_mode(mode="PAUSE", reason=reason_text, target_vps_ids=targets)
         return web.json_response(status)
 
     async def handle_manual_resume(self, request: web.Request) -> web.Response:
@@ -307,8 +355,10 @@ class CoordinatorApp:
         except Exception:
             payload = {}
         reason = payload.get("reason") if isinstance(payload, dict) else None
-        reason_text = reason if isinstance(reason, str) and reason.strip() else "Manual resume triggered"
-        status = await self.state.set_mode(mode="RUN", reason=reason_text)
+        targets = self._extract_target_vps(payload)
+        default_reason = "Manual resume (selected)" if targets else "Manual resume triggered"
+        reason_text = reason if isinstance(reason, str) and reason.strip() else default_reason
+        status = await self.state.set_mode(mode="RUN", reason=reason_text, target_vps_ids=targets)
         return web.json_response(status)
 
     async def handle_dashboard(self, request: web.Request) -> web.Response:
@@ -320,6 +370,22 @@ class CoordinatorApp:
         return web.Response(text=html, content_type="text/html")
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _extract_target_vps(payload: Dict[str, Any]) -> Optional[List[str]]:
+        if not isinstance(payload, dict):
+            return None
+        candidates: List[str] = []
+        single = payload.get("vps_id")
+        if isinstance(single, str) and single.strip():
+            candidates.append(single.strip())
+        multiple = payload.get("vps_ids")
+        if isinstance(multiple, list):
+            for item in multiple:
+                if isinstance(item, str) and item.strip():
+                    candidates.append(item.strip())
+        unique = list(dict.fromkeys(candidates))
+        return unique or None
+
     def _require_dashboard_auth(self, request: web.Request) -> None:
         if not self.dashboard_user and not self.dashboard_password:
             return
