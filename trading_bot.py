@@ -126,6 +126,9 @@ class TradingBot:
         self._last_mismatch_alert_state = None
         self._mismatch_notified_state = None
         self._manual_balance_lock = asyncio.Lock()
+        self._coordinator_registered = False
+        self._coordinator_register_lock = asyncio.Lock()
+        self._coordinator_last_register_attempt = 0.0
 
         self.order_filled_amount = Decimal("0")
 
@@ -302,16 +305,54 @@ class TradingBot:
 
         return default_side
 
+    @staticmethod
+    def _normalize_bool(value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "1"}:
+                return True
+            if lowered in {"false", "no", "0"}:
+                return False
+        return None
+
+    def _is_close_order(self, order: Any) -> bool:
+        order_type = getattr(order, "order_type", None)
+        if order_type is None and isinstance(order, dict):
+            order_type = order.get("order_type") or order.get("type")
+        if order_type is not None:
+            normalized_type = str(order_type).strip().lower()
+            if normalized_type in {"close", "closing", "take_profit", "tp", "reduce", "reduce_only"}:
+                return True
+            if normalized_type in {"open", "opening", "entry"}:
+                return False
+
+        reduce_only = getattr(order, "reduce_only", None)
+        if reduce_only is None and isinstance(order, dict):
+            reduce_only = order.get("reduce_only")
+        normalized_reduce_only = self._normalize_bool(reduce_only)
+        if normalized_reduce_only is not None:
+            return normalized_reduce_only
+
+        return True
+
     def _prepare_close_orders(
         self,
         orders: List[Any],
         position_amt: Optional[Decimal] = None,
     ) -> Tuple[List[Dict[str, Any]], Decimal, Optional[str]]:
-        close_side = self._closing_side_for_position(position_amt=position_amt, orders=orders)
+        filtered_orders: List[Any] = []
+        for order in orders:
+            if not self._is_close_order(order):
+                continue
+            filtered_orders.append(order)
+
+        close_side = self._closing_side_for_position(position_amt=position_amt, orders=filtered_orders)
         close_orders: List[Dict[str, Any]] = []
         total = Decimal("0")
 
-        for order in orders:
+        for order in filtered_orders:
             side_raw = getattr(order, "side", None)
             if side_raw is None and isinstance(order, dict):
                 side_raw = order.get("side")
@@ -385,6 +426,8 @@ class TradingBot:
     ) -> None:
         if not self.coordinator_enabled or not self.config.coordinator_vps_id:
             return
+        if not await self._ensure_coordinator_registered():
+            return
         message = (
             f"Position {position} vs closing {active_close} (diff {mismatch})"
             if severity != "resolved"
@@ -445,19 +488,23 @@ class TradingBot:
             try:
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                 position_amt = await self.exchange_client.get_account_positions()
-                self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
+                self.active_close_orders, active_close_amount, close_side = self._prepare_close_orders(
                     active_orders,
                     position_amt,
                 )
                 self._active_close_amount = active_close_amount
                 self._active_close_amount = active_close_amount
 
-                adjusted = await self._attempt_auto_balance(position_amt, active_close_amount)
+                adjusted = await self._attempt_auto_balance(
+                    position_amt,
+                    active_close_amount,
+                    close_side_hint=close_side,
+                )
                 if adjusted:
                     await asyncio.sleep(3)
                     refreshed_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                     position_amt = await self.exchange_client.get_account_positions()
-                    self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
+                    self.active_close_orders, active_close_amount, close_side = self._prepare_close_orders(
                         refreshed_orders,
                         position_amt,
                     )
@@ -529,6 +576,11 @@ class TradingBot:
             ) as response:
                 if response.status >= 400:
                     text = await response.text()
+                    if response.status == 404 and "not registered" in text.lower():
+                        self.logger.log("协调机提示节点未注册，准备重新注册", "WARNING")
+                        self._coordinator_registered = False
+                        self._coordinator_last_register_attempt = 0.0
+                        return None
                     raise RuntimeError(f"{method} {path} -> {response.status}: {text}")
                 content_type = response.headers.get("Content-Type", "")
                 if "application/json" in content_type:
@@ -540,36 +592,57 @@ class TradingBot:
             self.logger.log(f"协调机请求异常 {method} {path}: {exc}", "WARNING")
             return None
 
-    async def _init_coordinator(self) -> None:
+    async def _ensure_coordinator_registered(self) -> bool:
+        if not self.coordinator_enabled or self._coordinator_base_url is None:
+            return False
+        if self._coordinator_registered:
+            return True
+        async with self._coordinator_register_lock:
+            if self._coordinator_registered:
+                return True
+            now = time.time()
+            retry_interval = max(self._command_poll_interval, 3.0)
+            if now - self._coordinator_last_register_attempt < retry_interval:
+                return False
+            self._coordinator_last_register_attempt = now
+            success = await self._init_coordinator()
+            return success
+
+    async def _init_coordinator(self) -> bool:
         if not self.coordinator_enabled:
-            return
+            return False
         payload = {"vps_id": self.config.coordinator_vps_id}
         if self.config.coordinator_alias:
             payload["display_name"] = self.config.coordinator_alias
         response = await self._coordinator_request("POST", "/register", json=payload)
         if not isinstance(response, dict):
-            self.logger.log("无法注册协调机，功能已禁用", "WARNING")
-            await self._shutdown_coordinator(disable=True)
-            return
+            self.logger.log("无法注册协调机，稍后将自动重试", "WARNING")
+            self._coordinator_registered = False
+            return False
         action = str(response.get("mode") or response.get("action") or "RUN").upper()
         if action not in {"RUN", "PAUSE"}:
             action = "RUN"
         self._coordinator_mode = cast(Action, action)
         self._coordinator_reason = response.get("reason") if isinstance(response.get("reason"), str) else None
+        self._coordinator_registered = True
         self.logger.log(
             f"已连接协调机，当前模式: {self._coordinator_mode}"
             + (f", 原因: {self._coordinator_reason}" if self._coordinator_reason else ""),
             "INFO",
         )
+        return True
 
     def _start_coordinator_tasks(self) -> None:
-        if not self.coordinator_enabled:
+        if not self.coordinator_enabled or self._coordinator_tasks:
             return
         self._coordinator_tasks.append(asyncio.create_task(self._poll_coordinator_commands()))
         self._coordinator_tasks.append(asyncio.create_task(self._push_coordinator_metrics()))
 
     async def _poll_coordinator_commands(self) -> None:
         while not self.shutdown_requested and self.coordinator_enabled:
+            if not await self._ensure_coordinator_registered():
+                await asyncio.sleep(self._command_poll_interval)
+                continue
             data = await self._coordinator_request(
                 "GET",
                 "/command",
@@ -593,6 +666,9 @@ class TradingBot:
                 if isinstance(actions_payload, list) and actions_payload:
                     for action_payload in actions_payload:
                         asyncio.create_task(self._handle_coordinator_action(action_payload))
+            else:
+                await asyncio.sleep(self._command_poll_interval)
+                continue
             await asyncio.sleep(self._command_poll_interval)
 
     async def _build_coordinator_metrics_payload(self) -> Optional[Dict[str, Any]]:
@@ -740,6 +816,9 @@ class TradingBot:
 
     async def _push_coordinator_metrics(self) -> None:
         while not self.shutdown_requested and self.coordinator_enabled:
+            if not await self._ensure_coordinator_registered():
+                await asyncio.sleep(self._metrics_interval)
+                continue
             payload = await self._build_coordinator_metrics_payload()
             if payload is not None:
                 await self._coordinator_request("POST", "/metrics", json=payload)
@@ -770,6 +849,7 @@ class TradingBot:
         self._coordinator_auth = None
         if disable:
             self.coordinator_enabled = False
+        self._coordinator_registered = False
 
     def _calculate_wait_time(self) -> int:
         """Calculate wait time between orders."""
@@ -981,7 +1061,7 @@ class TradingBot:
                 position_amt = await self.exchange_client.get_account_positions()
 
                 # Filter close orders based on actual position direction
-                self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
+                self.active_close_orders, active_close_amount, close_side = self._prepare_close_orders(
                     active_orders,
                     position_amt,
                 )
@@ -993,7 +1073,11 @@ class TradingBot:
                 lower_threshold = 2 * self.config.quantity
                 upper_threshold = 4 * self.config.quantity
                 if lower_threshold < mismatch_amount <= upper_threshold:
-                    auto_balanced = await self._attempt_auto_balance(position_amt, active_close_amount)
+                    auto_balanced = await self._attempt_auto_balance(
+                        position_amt,
+                        active_close_amount,
+                        close_side_hint=close_side,
+                    )
                     if auto_balanced:
                         # Give exchange a moment to reflect newly submitted orders
                         await asyncio.sleep(3)
@@ -1001,7 +1085,7 @@ class TradingBot:
                         # Refresh orders and positions after balancing attempt
                         active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
                         position_amt = await self.exchange_client.get_account_positions()
-                        self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
+                        self.active_close_orders, active_close_amount, close_side = self._prepare_close_orders(
                             active_orders,
                             position_amt,
                         )
@@ -1049,12 +1133,23 @@ class TradingBot:
 
             print("--------------------------------")
 
-    async def _attempt_auto_balance(self, position_amt: Decimal, active_close_amount: Decimal) -> bool:
+    async def _attempt_auto_balance(
+        self,
+        position_amt: Decimal,
+        active_close_amount: Decimal,
+        close_side_hint: Optional[str] = None,
+    ) -> bool:
         """Try to automatically balance position and close orders when mismatch is moderate."""
         try:
             position_abs = abs(position_amt)
             difference = position_abs - active_close_amount
-            close_side = self._closing_side_for_position(position_amt)
+            normalized_hint = (close_side_hint or "").strip().lower()
+            if normalized_hint in {"buy", "sell"}:
+                close_side = normalized_hint
+            else:
+                close_side = self._closing_side_for_position(position_amt)
+            if close_side not in {"buy", "sell"}:
+                close_side = self.config.close_order_side
 
             if difference == 0:
                 return False
@@ -1225,9 +1320,8 @@ class TradingBot:
             await asyncio.sleep(5)
 
             if self.coordinator_enabled:
-                await self._init_coordinator()
-                if self.coordinator_enabled:
-                    self._start_coordinator_tasks()
+                await self._ensure_coordinator_registered()
+                self._start_coordinator_tasks()
 
             # Main trading loop
             while not self.shutdown_requested:
