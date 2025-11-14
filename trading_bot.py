@@ -231,6 +231,16 @@ class TradingBot:
             return
         self._coordinator_trade_volume += qty * px
 
+    @staticmethod
+    def _position_direction_from_amount(amount: Optional[Decimal]) -> str:
+        if amount is None:
+            return "flat"
+        if amount > 0:
+            return "long"
+        if amount < 0:
+            return "short"
+        return "flat"
+
     def _closing_side_for_position(
         self,
         position_amt: Optional[Decimal] = None,
@@ -575,6 +585,7 @@ class TradingBot:
         except Exception as exc:
             self.logger.log(f"获取仓位失败（协调机上报将使用0）: {exc}", "WARNING")
             position = Decimal("0")
+        position_direction = self._position_direction_from_amount(position)
 
         position_symbol: Optional[str] = None
         position_value: Optional[Decimal] = None
@@ -629,6 +640,7 @@ class TradingBot:
                 })
             manual_preview = {
                 "position": str(position),
+                "position_direction": position_direction,
                 "position_abs": str(abs(position)),
                 "active_close_amount": str(close_total),
                 "difference": str(mismatch_amount),
@@ -682,6 +694,7 @@ class TradingBot:
         payload: Dict[str, Any] = {
             "vps_id": self.config.coordinator_vps_id,
             "position": str(position),
+            "position_direction": position_direction,
             "trading_volume": str(self._coordinator_trade_volume),
             "balance": str(balance),
             "total_value": str(total_value) if total_value is not None else None,

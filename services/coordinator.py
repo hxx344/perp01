@@ -55,6 +55,7 @@ class VPSState:
     position: Decimal = Decimal("0")
     position_symbol: Optional[str] = None
     position_value: Optional[Decimal] = None
+    position_direction: Optional[str] = None
     trading_volume: Decimal = Decimal("0")
     balance: Decimal = Decimal("0")
     total_value: Optional[Decimal] = None
@@ -69,6 +70,7 @@ class VPSState:
             "position": str(self.position),
             "position_symbol": self.position_symbol,
             "position_value": str(self.position_value) if self.position_value is not None else None,
+            "position_direction": self.position_direction,
             "trading_volume": str(self.trading_volume),
             "balance": str(self.balance),
             "total_value": str(self.total_value) if self.total_value is not None else None,
@@ -117,6 +119,7 @@ class CoordinatorState:
         position: Decimal,
         position_symbol: Optional[str],
         position_value: Optional[Decimal],
+    position_direction: Optional[str] = None,
         trading_volume: Decimal,
         balance: Decimal,
         total_value: Optional[Decimal],
@@ -130,6 +133,14 @@ class CoordinatorState:
             state.position = position
             state.position_symbol = position_symbol
             state.position_value = position_value
+            if isinstance(position_direction, str):
+                normalized_direction = position_direction.strip().lower()
+                if normalized_direction in {"long", "short", "flat"}:
+                    state.position_direction = normalized_direction
+                else:
+                    state.position_direction = None
+            else:
+                state.position_direction = None
             state.trading_volume = trading_volume
             state.balance = balance
             state.total_value = total_value
@@ -296,6 +307,7 @@ class CoordinatorState:
             "has_position_value": False,
             "has_total_value": False,
             "alerts": {"warning": 0, "critical": 0},
+            "position_direction": "flat",
         }
         agents_snapshot = []
         for agent in self._agents.values():
@@ -324,6 +336,14 @@ class CoordinatorState:
                 if severity in totals["alerts"]:
                     totals["alerts"][severity] += 1
 
+        position_total = totals["position"]
+        if position_total > 0:
+            totals["position_direction"] = "long"
+        elif position_total < 0:
+            totals["position_direction"] = "short"
+        else:
+            totals["position_direction"] = "flat"
+
         return {
             "mode": self._mode,
             "reason": self._reason,
@@ -336,6 +356,7 @@ class CoordinatorState:
                 "balance": str(totals["balance"]),
                 "total_value": str(totals["total_value"]) if totals["has_total_value"] else None,
                 "alerts": totals["alerts"],
+                "position_direction": totals["position_direction"],
             },
         }
 
@@ -398,6 +419,9 @@ class CoordinatorApp:
         position_symbol = payload.get("position_symbol")
         if position_symbol is not None and not isinstance(position_symbol, str):
             raise web.HTTPBadRequest(text="position_symbol must be string when provided")
+        position_direction_raw = payload.get("position_direction")
+        if position_direction_raw is not None and not isinstance(position_direction_raw, str):
+            position_direction_raw = str(position_direction_raw)
         trading_volume = _to_decimal(payload.get("trading_volume"))
         balance = _to_decimal(payload.get("balance"))
         total_value_raw = payload.get("total_value")
@@ -414,6 +438,7 @@ class CoordinatorApp:
             position=position,
             position_symbol=position_symbol,
             position_value=position_value,
+            position_direction=position_direction_raw,
             trading_volume=trading_volume,
             balance=balance,
             total_value=total_value,

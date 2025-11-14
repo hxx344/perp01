@@ -521,6 +521,35 @@
       return normalized.toUpperCase();
     }
 
+    function formatDirectionLabel(direction) {
+      if (!direction) {
+        return '';
+      }
+      const normalized = String(direction).toLowerCase();
+      if (normalized === 'long') {
+        return '多头';
+      }
+      if (normalized === 'short') {
+        return '空头';
+      }
+      if (normalized === 'flat') {
+        return '空仓';
+      }
+      return normalized;
+    }
+
+    function formatPositionWithDirection(value, direction) {
+      const base = (value === undefined || value === null || value === '') ? '-' : String(value);
+      const dirLabel = formatDirectionLabel(direction);
+      if (!dirLabel) {
+        return base;
+      }
+      if (base === '-' || base.trim() === '') {
+        return dirLabel;
+      }
+      return `${base} · ${dirLabel}`;
+    }
+
     function formatCommand(agent) {
       const commandRaw = agent && agent.command ? String(agent.command).toUpperCase() : 'RUN';
       const isPause = commandRaw === 'PAUSE';
@@ -601,7 +630,7 @@
         const stats = [
           {
             label: '当前仓位',
-            value: preview.position,
+            value: formatPositionWithDirection(preview.position, preview.position_direction),
             danger: false,
           },
           {
@@ -834,7 +863,7 @@
       }
 
       const totals = data.totals || {};
-      totalPositionEl.textContent = totals.position ?? '-';
+  totalPositionEl.textContent = formatPositionWithDirection(totals.position, totals.position_direction);
       totalPositionValueEl.textContent = totals.position_value ?? '-';
       totalVolumeEl.textContent = totals.trading_volume ?? '-';
       totalBalanceEl.textContent = totals.balance ?? '-';
@@ -876,7 +905,7 @@
             <td>${safeText(agent.vps_id)}</td>
             <td>${safeText(agent.display_name)}</td>
             <td>${formatCommand(agent)}</td>
-            <td>${safeText(agent.position)}</td>
+            <td>${safeText(formatPositionWithDirection(agent.position, agent.position_direction))}</td>
             <td>${safeText(agent.position_symbol)}</td>
             <td>${safeText(agent.position_value)}</td>
             <td>${safeText(agent.trading_volume)}</td>
