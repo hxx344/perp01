@@ -91,6 +91,7 @@ class TradingBot:
 
         # Trading state
         self.active_close_orders = []
+        self._active_close_amount = Decimal("0")
         self.last_close_orders = 0
         self.last_open_order_time = 0
         self.last_log_time = 0
@@ -231,14 +232,28 @@ class TradingBot:
             return
         self._coordinator_trade_volume += qty * px
 
-    @staticmethod
-    def _position_direction_from_amount(amount: Optional[Decimal]) -> str:
-        if amount is None:
-            return "flat"
-        if amount > 0:
-            return "long"
-        if amount < 0:
+    def _position_direction_from_amount(
+        self,
+        amount: Optional[Decimal],
+        *,
+        close_side_hint: Optional[str] = None,
+    ) -> str:
+        hint = (close_side_hint or "").lower()
+        if hint == "buy":
             return "short"
+        if hint == "sell":
+            return "long"
+
+        if amount is not None:
+            if amount > 0:
+                return "long"
+            if amount < 0:
+                return "short"
+
+        if self.config.direction == "sell":
+            return "short"
+        if self.config.direction == "buy":
+            return "long"
         return "flat"
 
     def _closing_side_for_position(
@@ -434,6 +449,8 @@ class TradingBot:
                     active_orders,
                     position_amt,
                 )
+                self._active_close_amount = active_close_amount
+                self._active_close_amount = active_close_amount
 
                 adjusted = await self._attempt_auto_balance(position_amt, active_close_amount)
                 if adjusted:
@@ -444,6 +461,7 @@ class TradingBot:
                         refreshed_orders,
                         position_amt,
                     )
+                    self._active_close_amount = active_close_amount
                     mismatch_amount = abs(abs(position_amt) - active_close_amount)
                     severity = self._classify_mismatch_severity(mismatch_amount)
                     await self._update_mismatch_alert_state(
@@ -585,7 +603,8 @@ class TradingBot:
         except Exception as exc:
             self.logger.log(f"获取仓位失败（协调机上报将使用0）: {exc}", "WARNING")
             position = Decimal("0")
-        position_direction = self._position_direction_from_amount(position)
+
+        close_side_hint: Optional[str] = None
 
         position_symbol: Optional[str] = None
         position_value: Optional[Decimal] = None
@@ -628,6 +647,8 @@ class TradingBot:
 
         try:
             close_orders, close_total, close_side = self._prepare_close_orders(active_orders, position)
+            self._active_close_amount = close_total
+            close_side_hint = close_side
             mismatch_amount = abs(abs(position) - close_total)
             severity = self._classify_mismatch_severity(mismatch_amount)
             preview_orders: List[Dict[str, Any]] = []
@@ -640,7 +661,10 @@ class TradingBot:
                 })
             manual_preview = {
                 "position": str(position),
-                "position_direction": position_direction,
+                "position_direction": self._position_direction_from_amount(
+                    position,
+                    close_side_hint=close_side,
+                ),
                 "position_abs": str(abs(position)),
                 "active_close_amount": str(close_total),
                 "difference": str(mismatch_amount),
@@ -691,6 +715,11 @@ class TradingBot:
             except Exception as exc:
                 self.logger.log(f"获取余额失败: {exc}", "WARNING")
 
+        position_direction = self._position_direction_from_amount(
+            position,
+            close_side_hint=close_side_hint,
+        )
+
         payload: Dict[str, Any] = {
             "vps_id": self.config.coordinator_vps_id,
             "position": str(position),
@@ -700,6 +729,7 @@ class TradingBot:
             "total_value": str(total_value) if total_value is not None else None,
             "timestamp": time.time(),
         }
+        payload["active_close_amount"] = str(self._active_close_amount)
         if position_symbol:
             payload["position_symbol"] = position_symbol
         if position_value is not None:
@@ -975,6 +1005,7 @@ class TradingBot:
                             active_orders,
                             position_amt,
                         )
+                        self._active_close_amount = active_close_amount
                         position_abs = abs(position_amt)
                         mismatch_amount = abs(position_abs - active_close_amount)
 
@@ -1215,10 +1246,11 @@ class TradingBot:
                     snapshot_position = await self.exchange_client.get_account_positions()
                 except Exception:
                     snapshot_position = None
-                self.active_close_orders, _, _ = self._prepare_close_orders(
+                self.active_close_orders, active_close_amount, _ = self._prepare_close_orders(
                     active_orders,
                     snapshot_position,
                 )
+                self._active_close_amount = active_close_amount
 
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()

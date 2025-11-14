@@ -56,6 +56,7 @@ class VPSState:
     position_symbol: Optional[str] = None
     position_value: Optional[Decimal] = None
     position_direction: Optional[str] = None
+    active_close_amount: Decimal = Decimal("0")
     trading_volume: Decimal = Decimal("0")
     balance: Decimal = Decimal("0")
     total_value: Optional[Decimal] = None
@@ -71,6 +72,7 @@ class VPSState:
             "position_symbol": self.position_symbol,
             "position_value": str(self.position_value) if self.position_value is not None else None,
             "position_direction": self.position_direction,
+            "active_close_amount": str(self.active_close_amount),
             "trading_volume": str(self.trading_volume),
             "balance": str(self.balance),
             "total_value": str(self.total_value) if self.total_value is not None else None,
@@ -120,6 +122,7 @@ class CoordinatorState:
         position_symbol: Optional[str],
         position_value: Optional[Decimal],
     position_direction: Optional[str] = None,
+    active_close_amount: Optional[Decimal] = None,
         trading_volume: Decimal,
         balance: Decimal,
         total_value: Optional[Decimal],
@@ -141,6 +144,10 @@ class CoordinatorState:
                     state.position_direction = None
             else:
                 state.position_direction = None
+            if active_close_amount is not None:
+                state.active_close_amount = active_close_amount
+            else:
+                state.active_close_amount = Decimal("0")
             state.trading_volume = trading_volume
             state.balance = balance
             state.total_value = total_value
@@ -307,8 +314,10 @@ class CoordinatorState:
             "has_position_value": False,
             "has_total_value": False,
             "alerts": {"warning": 0, "critical": 0},
-            "position_direction": "flat",
+            "active_close_amount": Decimal("0"),
         }
+        total_long = Decimal("0")
+        total_short = Decimal("0")
         agents_snapshot = []
         for agent in self._agents.values():
             payload = agent.as_payload()
@@ -331,18 +340,28 @@ class CoordinatorState:
             if agent.total_value is not None:
                 totals["total_value"] += agent.total_value
                 totals["has_total_value"] = True
+            totals["active_close_amount"] += agent.active_close_amount
+            if agent.position_direction == "long":
+                total_long += abs(agent.position)
+            elif agent.position_direction == "short":
+                total_short += abs(agent.position)
             for alert in payload.get("alerts", []):
                 severity = str(alert.get("severity", "")).lower()
                 if severity in totals["alerts"]:
                     totals["alerts"][severity] += 1
 
-        position_total = totals["position"]
-        if position_total > 0:
-            totals["position_direction"] = "long"
-        elif position_total < 0:
-            totals["position_direction"] = "short"
+        if total_long > total_short:
+            position_direction = "long"
+        elif total_short > total_long:
+            position_direction = "short"
         else:
-            totals["position_direction"] = "flat"
+            position_total = totals["position"]
+            if position_total > 0:
+                position_direction = "long"
+            elif position_total < 0:
+                position_direction = "short"
+            else:
+                position_direction = "flat"
 
         return {
             "mode": self._mode,
@@ -356,7 +375,8 @@ class CoordinatorState:
                 "balance": str(totals["balance"]),
                 "total_value": str(totals["total_value"]) if totals["has_total_value"] else None,
                 "alerts": totals["alerts"],
-                "position_direction": totals["position_direction"],
+                "position_direction": position_direction,
+                "active_close_amount": str(totals["active_close_amount"]),
             },
         }
 
@@ -432,6 +452,8 @@ class CoordinatorApp:
         preview_payload = payload.get("manual_balance_preview")
         if not isinstance(preview_payload, dict):
             preview_payload = None
+        active_close_raw = payload.get("active_close_amount")
+        active_close_amount = _to_decimal(active_close_raw) if active_close_raw is not None else Decimal("0")
 
         status = await self.state.update_metrics(
             vps_id=vps_id,
@@ -439,6 +461,7 @@ class CoordinatorApp:
             position_symbol=position_symbol,
             position_value=position_value,
             position_direction=position_direction_raw,
+            active_close_amount=active_close_amount,
             trading_volume=trading_volume,
             balance=balance,
             total_value=total_value,
