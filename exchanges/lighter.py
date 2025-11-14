@@ -59,6 +59,8 @@ class LighterClient(BaseExchangeClient):
         self.orders_cache = {}
         self.current_order_client_id = None
         self.current_order = None
+        self._last_account_details = None
+        self._last_account_details_time = 0.0
 
     def _validate_config(self) -> None:
         """Validate Lighter configuration."""
@@ -119,6 +121,42 @@ class LighterClient(BaseExchangeClient):
                 self.logger.log(f"Failed to initialize Lighter client: {e}", "ERROR")
                 raise
         return self.lighter_client
+
+    @query_retry(reraise=True)
+    async def _fetch_account_details(
+        self,
+        *,
+        use_cache: bool = True,
+        cache_ttl: float = 5.0,
+    ) -> Any:
+        """Fetch detailed account information from the REST API."""
+        if self.api_client is None:
+            raise RuntimeError("API client not initialized. Call connect() first.")
+
+        if use_cache and self._last_account_details is not None:
+            if time.time() - self._last_account_details_time <= cache_ttl:
+                return self._last_account_details
+
+        account_api = lighter.AccountApi(self.api_client)
+        account_data = await account_api.account(by="index", value=str(self.account_index))
+
+        if not account_data or not getattr(account_data, "accounts", None):
+            raise ValueError("Failed to fetch account details")
+
+        account_details = account_data.accounts[0]
+        self._last_account_details = account_details
+        self._last_account_details_time = time.time()
+        return account_details
+
+    @staticmethod
+    def _safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+        """Convert API-provided numeric values to Decimal safely."""
+        try:
+            if value is None:
+                return default
+            return Decimal(str(value))
+        except Exception:
+            return default
 
     async def connect(self) -> None:
         """Connect to Lighter."""
@@ -404,26 +442,29 @@ class LighterClient(BaseExchangeClient):
     async def get_order_info(self, order_id: str) -> Optional[OrderInfo]:
         """Get order information from Lighter using official SDK."""
         try:
-            # Use shared API client to get account info
-            account_api = lighter.AccountApi(self.api_client)
+            account_details = await self._fetch_account_details()
 
-            # Get account orders
-            account_data = await account_api.account(by="index", value=str(self.account_index))
+            for position in getattr(account_details, "positions", []):
+                if position.market_id != self.config.contract_id:
+                    continue
 
-            # Look for the specific order in account positions
-            for position in account_data.positions:
-                if position.symbol == self.config.ticker:
-                    position_amt = abs(float(position.position))
-                    if position_amt > 0.001:  # Only include significant positions
-                        return OrderInfo(
-                            order_id=order_id,
-                            side="buy" if float(position.position) > 0 else "sell",
-                            size=Decimal(str(position_amt)),
-                            price=Decimal(str(position.avg_price)),
-                            status="FILLED",  # Positions are filled orders
-                            filled_size=Decimal(str(position_amt)),
-                            remaining_size=Decimal('0')
-                        )
+                position_amt = self._safe_decimal(position.position)
+                if position_amt == Decimal("0"):
+                    continue
+
+                avg_price = self._safe_decimal(getattr(position, "avg_entry_price", None))
+                side = "buy" if position_amt > 0 else "sell"
+                size = abs(position_amt)
+
+                return OrderInfo(
+                    order_id=order_id,
+                    side=side,
+                    size=size,
+                    price=avg_price,
+                    status="FILLED",
+                    filled_size=size,
+                    remaining_size=Decimal("0"),
+                )
 
             return None
 
@@ -486,20 +527,10 @@ class LighterClient(BaseExchangeClient):
 
         return contract_orders
 
-    @query_retry(reraise=True)
     async def _fetch_positions_with_retry(self) -> List[Dict[str, Any]]:
         """Get positions using official SDK."""
-        # Use shared API client
-        account_api = lighter.AccountApi(self.api_client)
-
-        # Get account info
-        account_data = await account_api.account(by="index", value=str(self.account_index))
-
-        if not account_data or not account_data.accounts:
-            self.logger.log("Failed to get positions", "ERROR")
-            raise ValueError("Failed to get positions")
-
-        return account_data.accounts[0].positions
+        account_details = await self._fetch_account_details()
+        return account_details.positions
 
     async def get_account_positions(self) -> Decimal:
         """Get account positions using official SDK."""
@@ -509,9 +540,40 @@ class LighterClient(BaseExchangeClient):
         # Find position for current market
         for position in positions:
             if position.market_id == self.config.contract_id:
-                return Decimal(position.position)
+                return self._safe_decimal(position.position)
 
         return Decimal(0)
+
+    async def get_account_metrics(self) -> Dict[str, Decimal]:
+        """Return balance and total account value for coordinator metrics."""
+        account_details = await self._fetch_account_details()
+
+        available_balance = self._safe_decimal(getattr(account_details, "available_balance", None))
+        collateral = self._safe_decimal(getattr(account_details, "collateral", None))
+        total_asset_value = self._safe_decimal(getattr(account_details, "total_asset_value", None))
+        cross_asset_value = self._safe_decimal(getattr(account_details, "cross_asset_value", None))
+
+        if available_balance == Decimal("0") and collateral > Decimal("0"):
+            available_balance = collateral
+
+        metrics: Dict[str, Decimal] = {
+            "available_balance": available_balance,
+            "collateral": collateral,
+            "total_asset_value": total_asset_value,
+            "total_account_value": total_asset_value,
+            "cross_asset_value": cross_asset_value,
+        }
+        return metrics
+
+    async def get_available_balance(self) -> Decimal:
+        """Return only the available balance, reusing cached account data when possible."""
+        account_details = await self._fetch_account_details()
+        available_balance = self._safe_decimal(getattr(account_details, "available_balance", None))
+        if available_balance == Decimal("0"):
+            collateral = self._safe_decimal(getattr(account_details, "collateral", None))
+            if collateral > Decimal("0"):
+                available_balance = collateral
+        return available_balance
 
     async def get_contract_attributes(self) -> Tuple[str, Decimal]:
         """Get contract ID for a ticker."""
