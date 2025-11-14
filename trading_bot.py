@@ -231,17 +231,31 @@ class TradingBot:
             return
         self._coordinator_trade_volume += qty * px
 
-    def _prepare_close_orders(self, orders: List[Any]) -> Tuple[List[Dict[str, Any]], Decimal]:
+    def _closing_side_for_position(self, position_amt: Optional[Decimal]) -> str:
+        if position_amt is not None:
+            if position_amt > 0:
+                return "sell"
+            if position_amt < 0:
+                return "buy"
+        return self.config.close_order_side
+
+    def _prepare_close_orders(
+        self,
+        orders: List[Any],
+        position_amt: Optional[Decimal] = None,
+    ) -> Tuple[List[Dict[str, Any]], Decimal]:
+        close_side = self._closing_side_for_position(position_amt)
         close_orders: List[Dict[str, Any]] = []
         total = Decimal("0")
         for order in orders:
-            if order.side != self.config.close_order_side:
+            if close_side and order.side != close_side:
                 continue
             size_decimal = self._safe_decimal(order.size)
             close_orders.append({
                 "id": order.order_id,
                 "price": order.price,
                 "size": size_decimal,
+                "side": order.side,
             })
             total += size_decimal
         return close_orders, total
@@ -344,15 +358,21 @@ class TradingBot:
             self.logger.log(f"收到协调机手动平衡指令{reason_text}", "WARNING")
             try:
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-                self.active_close_orders, active_close_amount = self._prepare_close_orders(active_orders)
                 position_amt = await self.exchange_client.get_account_positions()
+                self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                    active_orders,
+                    position_amt,
+                )
 
                 adjusted = await self._attempt_auto_balance(position_amt, active_close_amount)
                 if adjusted:
                     await asyncio.sleep(3)
                     refreshed_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-                    self.active_close_orders, active_close_amount = self._prepare_close_orders(refreshed_orders)
                     position_amt = await self.exchange_client.get_account_positions()
+                    self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                        refreshed_orders,
+                        position_amt,
+                    )
                     mismatch_amount = abs(abs(position_amt) - active_close_amount)
                     severity = self._classify_mismatch_severity(mismatch_amount)
                     await self._update_mismatch_alert_state(
@@ -361,6 +381,7 @@ class TradingBot:
                         active_close=active_close_amount,
                         mismatch=mismatch_amount,
                     )
+                    self._mismatch_notified_state = severity
                     self.logger.log("手动平衡已执行，已刷新仓位数据", "INFO")
                 else:
                     mismatch_amount = abs(abs(position_amt) - active_close_amount)
@@ -371,6 +392,7 @@ class TradingBot:
                         active_close=active_close_amount,
                         mismatch=mismatch_amount,
                     )
+                    self._mismatch_notified_state = severity
                     self.logger.log("手动平衡无需调整（仓位与平仓单匹配）", "INFO")
             except Exception as exc:
                 self.logger.log(f"手动平衡失败: {exc}", "ERROR")
@@ -809,14 +831,15 @@ class TradingBot:
         if time.time() - self.last_log_time > 60 or self.last_log_time == 0:
             print("--------------------------------")
             try:
-                # Get active orders
+                # Get active orders and current position
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-
-                # Filter close orders
-                self.active_close_orders, active_close_amount = self._prepare_close_orders(active_orders)
-
-                # Get positions
                 position_amt = await self.exchange_client.get_account_positions()
+
+                # Filter close orders based on actual position direction
+                self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                    active_orders,
+                    position_amt,
+                )
                 position_abs = abs(position_amt)
                 mismatch_amount = abs(position_abs - active_close_amount)
 
@@ -832,8 +855,11 @@ class TradingBot:
 
                         # Refresh orders and positions after balancing attempt
                         active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-                        self.active_close_orders, active_close_amount = self._prepare_close_orders(active_orders)
                         position_amt = await self.exchange_client.get_account_positions()
+                        self.active_close_orders, active_close_amount = self._prepare_close_orders(
+                            active_orders,
+                            position_amt,
+                        )
                         position_abs = abs(position_amt)
                         mismatch_amount = abs(position_abs - active_close_amount)
 
@@ -882,6 +908,7 @@ class TradingBot:
         try:
             position_abs = abs(position_amt)
             difference = position_abs - active_close_amount
+            close_side = self._closing_side_for_position(position_amt)
 
             if difference == 0:
                 return False
@@ -892,7 +919,6 @@ class TradingBot:
                     self.logger.log("[AUTO-BALANCE] Max close orders reached; cannot add more.", "WARNING")
                     return False
 
-                close_side = self.config.close_order_side
                 best_bid, best_ask = await self.exchange_client.fetch_bbo_prices(self.config.contract_id)
                 tp_multiplier = self.config.take_profit / Decimal('100')
                 if close_side == 'sell':
@@ -929,7 +955,7 @@ class TradingBot:
                 return False
 
             canceled_amount = Decimal('0')
-            reverse_sort = True if self.config.close_order_side == 'sell' else False
+            reverse_sort = True if close_side == 'sell' else False
             for order in sorted(self.active_close_orders, key=lambda o: o['price'], reverse=reverse_sort):
                 if canceled_amount >= excess:
                     break
@@ -1068,18 +1094,16 @@ class TradingBot:
                     continue
                 self._coordinator_pause_logged = False
 
-                # Update active orders
+                # Update active orders and cached close order view
                 active_orders = await self.exchange_client.get_active_orders(self.config.contract_id)
-
-                # Filter close orders
-                self.active_close_orders = []
-                for order in active_orders:
-                    if order.side == self.config.close_order_side:
-                        self.active_close_orders.append({
-                            'id': order.order_id,
-                            'price': order.price,
-                            'size': order.size
-                        })
+                try:
+                    snapshot_position = await self.exchange_client.get_account_positions()
+                except Exception:
+                    snapshot_position = None
+                self.active_close_orders, _ = self._prepare_close_orders(
+                    active_orders,
+                    snapshot_position,
+                )
 
                 # Periodic logging
                 mismatch_detected = await self._log_status_periodically()
