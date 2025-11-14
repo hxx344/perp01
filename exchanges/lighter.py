@@ -269,6 +269,22 @@ class LighterClient(BaseExchangeClient):
             if status in ['FILLED', 'CANCELED']:
                 self.logger.log_transaction(order_id, side, filled_size, price, status)
 
+            if self._order_update_handler:
+                try:
+                    payload = {
+                        "contract_id": self.config.contract_id,
+                        "order_id": str(order_id),
+                        "status": status,
+                        "side": side,
+                        "order_type": order_type,
+                        "filled_size": str(filled_size),
+                        "size": str(size),
+                        "price": str(price),
+                    }
+                    self._order_update_handler(payload)
+                except Exception as exc:
+                    self.logger.log(f"Error dispatching order update: {exc}", "ERROR")
+
     @query_retry(default_return=(0, 0))
     async def fetch_bbo_prices(self, contract_id: str) -> Tuple[Decimal, Decimal]:
         """Get orderbook using official SDK."""
