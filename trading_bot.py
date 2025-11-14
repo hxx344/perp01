@@ -9,7 +9,7 @@ import traceback
 import inspect
 from contextlib import suppress
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, InvalidOperation
 from typing import Optional, Dict, Any, List, Tuple, TYPE_CHECKING, Literal, Iterable, cast
 
 from exchanges import ExchangeFactory
@@ -129,6 +129,7 @@ class TradingBot:
         self._coordinator_registered = False
         self._coordinator_register_lock = asyncio.Lock()
         self._coordinator_last_register_attempt = 0.0
+        self._residual_close_amount = Decimal("0")
 
         self.order_filled_amount = Decimal("0")
 
@@ -225,6 +226,64 @@ class TradingBot:
     def _safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
         parsed = TradingBot._safe_decimal_or_none(value)
         return parsed if parsed is not None else default
+
+    def _close_quantity_step(self) -> Optional[Decimal]:
+        step_candidate = getattr(self.exchange_client, "quantity_step", None)
+        if step_candidate is not None:
+            try:
+                step_decimal = Decimal(str(step_candidate))
+                if step_decimal > 0:
+                    return step_decimal
+            except (InvalidOperation, ValueError, TypeError):
+                pass
+
+        multiplier_candidate = getattr(self.exchange_client, "base_amount_multiplier", None)
+        if multiplier_candidate is not None:
+            try:
+                multiplier_decimal = Decimal(str(multiplier_candidate))
+                if multiplier_decimal > 0:
+                    return Decimal("1") / multiplier_decimal
+            except (InvalidOperation, ZeroDivisionError, ValueError, TypeError):
+                pass
+
+        return None
+
+    def _prepare_close_quantity(self, amount: Decimal) -> Optional[Decimal]:
+        amount = self._safe_decimal(amount, default=Decimal("0"))
+        if amount <= 0:
+            return None
+
+        step = self._close_quantity_step()
+        total = amount + self._residual_close_amount
+
+        if step is None or step <= 0:
+            self._residual_close_amount = Decimal("0")
+            return total
+
+        if total < step:
+            self._residual_close_amount = total
+            return None
+
+        steps = (total / step).to_integral_value(rounding=ROUND_FLOOR)
+        adjusted = steps * step
+        residual = total - adjusted
+        if residual < 0:
+            residual = Decimal("0")
+        self._residual_close_amount = residual
+
+        if adjusted <= 0:
+            return None
+        return adjusted
+
+    def _quantize_close_amount(self, amount: Decimal) -> Decimal:
+        amount = self._safe_decimal(amount, default=Decimal("0"))
+        if amount <= 0:
+            return Decimal("0")
+        step = self._close_quantity_step()
+        if step is None or step <= 0:
+            return amount
+        steps = (amount / step).to_integral_value(rounding=ROUND_FLOOR)
+        return steps * step
 
     def _record_trade_volume(self, quantity: Any, price: Any) -> None:
         if not self.coordinator_enabled:
@@ -749,6 +808,7 @@ class TradingBot:
                 "orders": preview_orders,
                 "severity": severity,
                 "timestamp": time.time(),
+                "residual_close_amount": str(self._residual_close_amount),
             }
         except Exception as exc:
             self.logger.log(f"生成手动平衡预览失败: {exc}", "WARNING")
@@ -806,6 +866,7 @@ class TradingBot:
             "timestamp": time.time(),
         }
         payload["active_close_amount"] = str(self._active_close_amount)
+        payload["residual_close_amount"] = str(self._residual_close_amount)
         if position_symbol:
             payload["position_symbol"] = position_symbol
         if position_value is not None:
@@ -1020,11 +1081,21 @@ class TradingBot:
                             self.order_filled_amount = order_info.filled_size
 
             if self.order_filled_amount > 0:
+                prepared_quantity = self._prepare_close_quantity(self.order_filled_amount)
+                self.order_filled_amount = Decimal("0")
+                if prepared_quantity is None:
+                    self.logger.log(
+                        "[CLOSE] Filled amount below minimum order size; queued for next accumulation",
+                        "INFO",
+                    )
+                    self.last_open_order_time = time.time()
+                    return True
+
                 close_side = self.config.close_order_side
                 if self.config.boost_mode:
                     close_order_result = await self.exchange_client.place_close_order(
                         self.config.contract_id,
-                        self.order_filled_amount,
+                        prepared_quantity,
                         filled_price,
                         close_side
                     )
@@ -1036,7 +1107,7 @@ class TradingBot:
 
                     close_order_result = await self.exchange_client.place_close_order(
                         self.config.contract_id,
-                        self.order_filled_amount,
+                        prepared_quantity,
                         close_price,
                         close_side
                     )
@@ -1155,6 +1226,13 @@ class TradingBot:
                 return False
 
             if difference > 0:
+                close_quantity = self._quantize_close_amount(difference)
+                if close_quantity <= 0:
+                    self.logger.log(
+                        "[AUTO-BALANCE] Difference below minimum order size; waiting for more fills",
+                        "INFO",
+                    )
+                    return False
                 # Need additional close orders
                 if len(self.active_close_orders) >= self.config.max_orders:
                     self.logger.log("[AUTO-BALANCE] Max close orders reached; cannot add more.", "WARNING")
@@ -1172,14 +1250,14 @@ class TradingBot:
 
                 balance_result = await self.exchange_client.place_close_order(
                     self.config.contract_id,
-                    difference,
+                    close_quantity,
                     target_price,
                     close_side
                 )
 
                 if balance_result.success:
                     self.logger.log(
-                        f"[AUTO-BALANCE] Added close order: {difference} @ {target_price}",
+                        f"[AUTO-BALANCE] Added close order: {close_quantity} @ {target_price}",
                         "INFO"
                     )
                     return True
